@@ -8,7 +8,8 @@ import time
 
 import streamlit as st
 
-from services.data_tools import read_upload, sanitize_dataframe, MAX_TOTAL_BYTES
+from services.data_tools import read_upload, sanitize_dataframe, MAX_TOTAL_BYTES, excel_previews
+from openpyxl.utils import get_column_letter
 from agent.factory import build_model
 from services.context import bounded_chat
 from services.analysis import friendly_error, ANALYSIS_TIMEOUT
@@ -117,15 +118,50 @@ with st.sidebar:
         st.session_state.query_results = {}
         st.rerun()
 
+excel_options = {}
 if uploads:
-    sig = tuple((f.name, f.size, f.file_id) for f in uploads)
+    preview_cache = st.session_state.setdefault('excel_header_previews', {})
+    active_previews = {(f.name, f.size, f.file_id) for f in uploads if f.name.lower().endswith(('.xlsx', '.xls'))}
+    for cached in list(preview_cache):
+        if cached not in active_previews:
+            del preview_cache[cached]
+    for upload in uploads:
+        if not upload.name.lower().endswith(('.xlsx', '.xls')):
+            continue
+        cache_key = (upload.name, upload.size, upload.file_id)
+        try:
+            if cache_key not in preview_cache:
+                preview_cache[cache_key] = excel_previews(upload)
+            with st.sidebar.expander(f'Excel header settings: {upload.name}'):
+                st.caption('Preview shows original Excel row numbers. Change the header row if the sheet starts with titles or merged cells.')
+                for sheet, preview in preview_cache[cache_key].items():
+                    st.markdown(f'**{sheet}**')
+                    key = f'excel_{upload.file_id}_{sheet}'
+                    mode = st.selectbox('Header mode', ['Automatic', 'Select header row', 'No header'], key=key + '_mode')
+                    row, depth = 'auto', 1
+                    if mode == 'Select header row':
+                        row = int(st.number_input('Header starts at Excel row', min_value=1, max_value=1000,
+                                                  value=1, key=key + '_row')) - 1
+                        depth = int(st.number_input('Number of header rows', min_value=1, max_value=3,
+                                                    value=1, key=key + '_depth'))
+                    elif mode == 'No header':
+                        row = None
+                    excel_options.setdefault(upload.file_id, {})[sheet] = {'header_row': row, 'header_rows': depth}
+                    visible = preview.copy()
+                    visible.columns = [get_column_letter(i + 1) for i in range(len(visible.columns))]
+                    visible.index = range(1, len(visible) + 1)
+                    visible.index.name = 'Excel row'
+                    st.dataframe(sanitize_dataframe(visible), **WIDE)
+        except Exception as exc:
+            st.sidebar.warning(f'Excel header preview unavailable for {upload.name}: {exc}')
+    sig = (tuple((f.name, f.size, f.file_id) for f in uploads), json.dumps(excel_options, sort_keys=True))
     if sig != st.session_state.dataset_signature:
         try:
             if sum(f.size for f in uploads) > MAX_TOTAL_BYTES:
                 raise ValueError('Combined uploads must be 60 MB or smaller.')
             all_tables = {}
             for upload in uploads:
-                for name, frame in read_upload(upload).items():
+                for name, frame in read_upload(upload, excel_headers=excel_options.get(upload.file_id)).items():
                     if name in all_tables:
                         raise ValueError(f'Duplicate table name: {name}; rename one file.')
                     all_tables[name] = frame
@@ -154,6 +190,7 @@ if uploads:
             st.session_state.query_results = {}
             st.error(f'File loading failed: {e}')
 else:
+    st.session_state.excel_header_previews = {}
     if st.session_state.get('search_index'):
         st.session_state.search_index.close()
     st.session_state.search_index = None
@@ -173,6 +210,13 @@ if st.session_state.tables:
     st.subheader('Loaded datasets')
     for name, df in st.session_state.tables.items():
         with st.expander(f'{name} — {len(df):,} rows × {len(df.columns)} columns'):
+            if 'header_row' in df.attrs:
+                header = df.attrs['header_row']
+                st.caption(f"Headers: Excel row {header}, {df.attrs['header_rows']} row(s), {df.attrs['header_mode']}."
+                           if header is not None else 'No header detected/selected; all data rows are retained with positional column names.')
+                if df.attrs.get('generic_headers'):
+                    st.caption('Blank header cells use positional names: ' + ', '.join(df.attrs['generic_headers'])
+                               + '. Adjust Excel header settings in the sidebar if the real labels are on another row.')
             st.dataframe(sanitize_dataframe(df.head(100)), **WIDE)
 else:
     st.info('Upload a file using the left sidebar to start.')

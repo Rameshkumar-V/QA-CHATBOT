@@ -16,6 +16,10 @@ Deployment reference: https://docs.streamlit.io/deploy/streamlit-community-cloud
 
 ## General Q&A over uploaded data
 
+Excel headers are detected from a bounded preview of the first 30 rows, so sparse title/blank rows above a dense header are not automatically used as field names. The sidebar has **Excel header settings** for each workbook/sheet: Automatic, Select header row (Excel row numbers start at 1), or No header. Manual selection supports one to three header rows and combines merged group/child labels. A preview shows original row numbers. Review or override automatic selection for ambiguous or headerless layouts; automatic inference cannot distinguish every all-text layout.
+
+Header whitespace/newlines are cleaned, duplicates receive unique suffixes, and genuinely blank headers with data get positional labels such as Column D. Only completely empty columns and rows are removed. Data under a blank header is retained. The loaded-table caption shows the selected header row, and changes rebuild both query/search indexes and clear stale chat/results. The same cleaned column names and header metadata are passed to the Q&A planner. No subject-specific field names are used for detection.
+
 Questions use one schema-driven flow for every dataset. There are no field-name dictionaries, typo lists, topic-specific question handlers or preset answers. The model sees the actual uploaded column names and types and generates a JSON plan containing a read-only SQL query. The server validates and executes it against a session-local SQLite copy, then sends only a bounded computed result to the model for a concise answer. The result table and CSV are also available directly.
 
 This supports filters with multiple conditions, missing/present values, totals and averages, grouped comparisons, sorting, top-N rankings, duplicate detection, date expressions, subqueries, window functions and joins across uploaded sheets/files. Questions requiring unavailable information or ambiguous fields should receive a clarification instead of an invented result. Native provider tool calling is not required.

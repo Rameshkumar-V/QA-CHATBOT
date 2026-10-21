@@ -7,6 +7,7 @@ from typing import Any
 import pandas as pd
 from langchain_core.tools import tool
 from services.search import DocumentSearch
+from services.excel_headers import column_names, preview_sheet, read_sheet
 
 MAX_BYTES = 20 * 1024 * 1024
 MAX_ROWS = 200_000
@@ -61,7 +62,7 @@ def compact(value: Any, max_chars=MAX_TOOL_CHARS) -> str:
 
 def sanitize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure DataFrame column names are strings and mixed-type columns are Arrow-compatible."""
-    df.columns = [str(c) for c in df.columns]
+    df.columns = column_names(df.columns)
     for col in (c for c in df.columns if df[c].dtype == 'object'):
         if df[col].map(lambda x: isinstance(x, bytes)).any():
             df[col] = df[col].map(lambda x: x.decode('utf-8', errors='replace') if isinstance(x, bytes) else x)
@@ -80,7 +81,7 @@ def sanitize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         return df_copy if df_copy is not None else df
 
 
-def read_upload(file) -> dict[str, pd.DataFrame]:
+def read_upload(file, excel_headers=None) -> dict[str, pd.DataFrame]:
     filename = file.name
     raw = file.getvalue()
     if len(raw) > MAX_BYTES:
@@ -99,7 +100,8 @@ def read_upload(file) -> dict[str, pd.DataFrame]:
             if len(book.sheet_names) > 30:
                 raise ValueError('Excel file has too many sheets (maximum 30)')
             for sheet in book.sheet_names:
-                tables[f'{filename} :: {sheet}'] = pd.read_excel(book, sheet_name=sheet, nrows=MAX_ROWS + 1)
+                options = (excel_headers or {}).get(sheet, {})
+                tables[f'{filename} :: {sheet}'] = read_sheet(book, sheet, MAX_ROWS, **options)
     elif suffix == 'json':
         data = json.loads(raw.decode('utf-8-sig'))
         if isinstance(data, list):
@@ -142,6 +144,17 @@ def read_upload(file) -> dict[str, pd.DataFrame]:
             raise ValueError(f'{name}: maximum {MAX_ROWS:,} rows per table')
         tables[name] = sanitize_dataframe(df)
     return tables
+
+
+def excel_previews(file):
+    raw = file.getvalue()
+    if len(raw) > MAX_BYTES:
+        raise ValueError('Files must be 20 MB or smaller.')
+    engine = 'openpyxl' if file.name.lower().endswith('.xlsx') else 'xlrd'
+    with pd.ExcelFile(io.BytesIO(raw), engine=engine) as book:
+        if len(book.sheet_names) > 30:
+            raise ValueError('Excel file has too many sheets (maximum 30).')
+        return {sheet: preview_sheet(book, sheet) for sheet in book.sheet_names}
 
 
 def make_tools(tables: dict[str, pd.DataFrame], search_index=None):

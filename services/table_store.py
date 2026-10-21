@@ -32,6 +32,10 @@ class TableStore:
         self.catalog = {f'T{i}': {'name': name, 'rows': len(frame), 'columns': [
             {'id': f'C{j}', 'name': str(column), 'type': str(frame.iloc[:, j].dtype)}
             for j, column in enumerate(frame.columns)]} for i, (name, frame) in enumerate(tables.items())}
+        for alias, frame in zip(self.catalog, tables.values()):
+            if 'header_row' in frame.attrs:
+                self.catalog[alias]['header'] = {key: frame.attrs[key] for key in
+                    ('header_row', 'header_rows', 'header_mode', 'generic_headers') if key in frame.attrs}
 
     def close(self):
         with self.lock:
