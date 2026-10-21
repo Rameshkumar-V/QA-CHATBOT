@@ -30,7 +30,8 @@ def friendly_error(exc):
     if kind in ('GraphRecursionError', 'ModelCallLimitExceededError'):
         return 'The agent ran out of steps before answering. Try a more specific question.'
     if status == 400 or 'tool' in detail and any(word in detail for word in ('failed', 'invalid', 'support')):
-        return 'The model made an invalid tool call. Retry, or switch to openai/gpt-oss-120b.'
+        return ('GroqCloud rejected the model\'s query three times in a row. Ask again, or rephrase the question '
+                'more specifically (for example name the column).')
     if isinstance(exc, ValueError) and str(exc).startswith(('Please shorten', 'The model', 'Enter your')):
         return str(exc)
     return 'Something went wrong while answering. Retry, or try a simpler question.'

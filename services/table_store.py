@@ -28,7 +28,8 @@ class TableResult:
 def to_number(value):
     if value is None or isinstance(value, (int, float)):
         return value
-    text = re.sub(r'[\s,₹$€£%]', '', str(value))
+    # Spaces inside digits are kept: "8235 9649 8073" is an identifier, not a number.
+    text = re.sub(r'[,₹$€£%]', '', str(value)).strip()
     if text.casefold() in MISSING_MARKERS:
         return None
     try:

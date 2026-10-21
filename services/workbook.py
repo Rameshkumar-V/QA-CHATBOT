@@ -52,11 +52,13 @@ class Workbook:
     def close(self):
         self.store.close()
 
-    def overview(self, ids=None, max_chars=4000, max_columns=60):
+    def overview(self, ids=None, max_chars=4000, max_columns=60, inline_rows=60, inline_chars=6000):
+        """Schema for every sheet; small sheets also include all their rows as CSV."""
         lines = ['Sheets (use the id in tool calls and as the SQL table name):']
+        inline_left = inline_chars
         for key in ids or self.frames:
             frame = self.frames[key]
-            lines.append(f'- {key}: "{self.labels[key]}", {len(frame):,} rows × {len(frame.columns)} columns')
+            lines.append(f'- {key}: "{self.labels[key]}", {len(frame):,} data rows × {len(frame.columns)} columns')
             if sum(map(len, lines)) > max_chars:
                 continue
             shown = [f'{c} ({column_kind(frame[c])})' for c in frame.columns[:max_columns]]
@@ -65,4 +67,25 @@ class Workbook:
             if frame.attrs.get('generic_headers'):
                 lines.append('  note: unlabelled columns ' + ', '.join(frame.attrs['generic_headers'][:10])
                              + ' (the header row may be wrong; the user can change it in Excel header settings)')
+            if frame.attrs.get('notes'):
+                lines.append('  text below the table (not data rows): '
+                             + ' | '.join(note[:200] for note in frame.attrs['notes'][:5]))
+            if len(frame) <= inline_rows:
+                data = csv_text(frame)
+                if len(data) <= inline_left:
+                    inline_left -= len(data)
+                    lines.append(f'  all {len(frame)} rows (CSV):\n{data}')
         return '\n'.join(lines)
+
+
+def csv_text(frame, cell_chars=60):
+    def short(value):
+        if value is None or (pd.api.types.is_scalar(value) and pd.isna(value)):
+            return ''
+        if isinstance(value, pd.Timestamp):
+            return value.date().isoformat() if value == value.normalize() else str(value)
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+        text = re.sub(r'\s+', ' ', str(value)).strip()
+        return text[:cell_chars] + '…' if len(text) > cell_chars else text
+    return frame.map(short).to_csv(index=False).strip()

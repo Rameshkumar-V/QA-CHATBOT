@@ -6,6 +6,7 @@ receives a whole sheet: row listings are capped, and the full result table is ke
 from dataclasses import dataclass
 import datetime as dt
 import difflib
+import inspect
 import json
 import operator
 import re
@@ -14,7 +15,7 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 from langchain_core.tools import StructuredTool
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from services.data_tools import compact, missing_mask
 from services.table_store import MAX_RESULT_ROWS, QueryExecutionError, to_number
@@ -36,74 +37,124 @@ class ToolError(ValueError):
     pass
 
 
+FILTER_OPS = ('=', '!=', '>', '>=', '<', '<=', 'contains', 'not_contains', 'starts_with', 'ends_with',
+              'in', 'not_in', 'between', 'is_missing', 'not_missing')
+METRIC_OPS = ('count', 'count_distinct', 'sum', 'mean', 'median', 'min', 'max', 'std')
+METRIC_ALIASES = {'avg': 'mean', 'average': 'mean', 'total': 'sum', 'nunique': 'count_distinct',
+                  'distinct': 'count_distinct', 'count_rows': 'count', 'minimum': 'min', 'maximum': 'max'}
+
+
+def as_list(value):
+    if value is None or value == '':
+        return []
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+def as_int(value, default):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def as_bool(value, default):
+    if isinstance(value, str):
+        return value.strip().casefold() in ('true', '1', 'yes', 'desc', 'descending')
+    return default if value is None else bool(value)
+
+
 class Filter(BaseModel):
     model_config = ConfigDict(coerce_numbers_to_str=True)
     column: str
-    op: Literal['=', '!=', '>', '>=', '<', '<=', 'contains', 'not_contains', 'starts_with', 'ends_with',
-                'in', 'not_in', 'between', 'is_missing', 'not_missing']
-    value: str = Field(default='', description='Text, number, or date as YYYY-MM-DD')
-    values: list[str] = Field(default_factory=list, description='For in/not_in, or [low, high] for between')
+    op: Literal[FILTER_OPS] = '='
+    value: str = ''
+    values: list[str] = Field(default_factory=list)
 
-    @field_validator('op', mode='before')
+    @model_validator(mode='before')
     @classmethod
-    def alias(cls, value):
-        value = str(value).strip().lower()
-        return OP_ALIASES.get(value, value)
+    def tolerate(cls, data):
+        if not isinstance(data, dict):
+            raise ValueError('each filter must be an object like {"column": "Name", "op": "=", "value": "x"}')
+        data = dict(data)
+        op = str(data.pop('operator', None) or data.get('op') or '=').strip().lower()
+        op = OP_ALIASES.get(op, op)
+        data['op'] = OP_ALIASES.get(re.sub(r'[\s-]+', '_', op), re.sub(r'[\s-]+', '_', op))
+        if isinstance(data.get('value'), (list, tuple)):
+            data['values'], data['value'] = list(data['value']), ''
+        if data.get('value') is None or isinstance(data.get('value'), bool):
+            data['value'] = '' if data.get('value') is None else str(data['value']).lower()
+        data['values'] = [str(v) for v in as_list(data.get('values'))]
+        return data
 
 
 class Metric(BaseModel):
-    op: Literal['count', 'count_distinct', 'sum', 'mean', 'median', 'min', 'max', 'std']
-    column: str = Field(default='', description='Omit for a row count')
+    op: Literal[METRIC_OPS]
+    column: str = ''
 
-    @field_validator('op', mode='before')
+    @model_validator(mode='before')
     @classmethod
-    def alias(cls, value):
-        value = str(value).strip().lower()
-        return {'avg': 'mean', 'average': 'mean', 'total': 'sum', 'nunique': 'count_distinct',
-                'distinct': 'count_distinct'}.get(value, value)
+    def tolerate(cls, data):
+        if isinstance(data, str):  # "sum(Amount)" or "count"
+            found = re.fullmatch(r'\s*(\w+)\s*(?:\(\s*(.*?)\s*\))?\s*', data)
+            data = {'op': found.group(1), 'column': found.group(2) or ''} if found else {'op': data}
+        data = dict(data)
+        op = str(data.pop('function', None) or data.get('op') or 'count').strip().lower()
+        data['op'] = METRIC_ALIASES.get(op, op)
+        data['column'] = '' if data.get('column') in (None, '*') else str(data['column'])
+        return data
 
     @property
     def label(self):
         return 'count' if self.op == 'count' and not self.column else f'{self.op}({self.column})'
 
 
-class DescribeArgs(BaseModel):
-    sheet: str = Field(description='Sheet id')
-    columns: list[str] = Field(default_factory=list, description='Only these columns (default: all)')
+def parse_items(model, items, kind):
+    parsed = []
+    for item in as_list(items):
+        try:
+            parsed.append(item if isinstance(item, model) else model.model_validate(item))
+        except ValidationError as exc:
+            allowed = FILTER_OPS if model is Filter else METRIC_OPS
+            problem = exc.errors()[0]
+            reason = (f'unknown op; use one of {", ".join(allowed)}' if problem['loc'] == ('op',)
+                      else f'{".".join(map(str, problem["loc"])) or "value"}: {problem["msg"]}')
+            raise ToolError(f'Invalid {kind} {item!r}: {reason}.') from None
+    return parsed
 
 
-class ReadArgs(BaseModel):
-    sheet: str = Field(description='Sheet id')
-    start: int = Field(default=1, description='First row number (1-based)')
-    count: int = Field(default=5, description=f'Rows to return, at most {MAX_MODEL_ROWS}')
-    columns: list[str] = Field(default_factory=list, description='Columns to return (default: all)')
+# Schemas are deliberately permissive. GroqCloud rejects the whole request when a tool call
+# does not match its schema; the tools coerce arguments and return fixable errors instead.
+def schema(**properties):
+    return {'type': 'object', 'properties': properties}
 
 
-class FindArgs(BaseModel):
-    sheet: str = Field(description='Sheet id')
-    filters: list[Filter] = Field(default_factory=list)
-    match: Literal['all', 'any'] = Field(default='all', description='Combine filters with AND (all) or OR (any)')
-    columns: list[str] = Field(default_factory=list, description='Columns to return; pick the useful ones')
-    sort_by: str = Field(default='', description='Column to sort by')
-    descending: bool = False
-    limit: int = Field(default=10, description=f'Rows shown to you, at most {MAX_MODEL_ROWS}')
-
-
-class AggregateArgs(BaseModel):
-    sheet: str = Field(description='Sheet id')
-    metrics: list[Metric] = Field(default_factory=list, description='Default: row count')
-    group_by: list[str] = Field(default_factory=list, description='Up to 3 columns')
-    time_grain: Literal['none', 'day', 'week', 'month', 'quarter', 'year'] = Field(
-        default='none', description='Bucket date columns in group_by')
-    filters: list[Filter] = Field(default_factory=list)
-    match: Literal['all', 'any'] = 'all'
-    sort_by: str = Field(default='', description='A metric label like sum(Amount), or a group column')
-    descending: bool = True
-    limit: int = Field(default=20, description=f'Groups shown to you, at most {MAX_MODEL_GROUPS}')
-
-
-class SqlArgs(BaseModel):
-    sql: str = Field(description='One read-only SQLite SELECT statement')
+SHEET = {'type': 'string', 'description': 'Sheet id from the overview (optional when there is one sheet)'}
+COLUMNS = {'type': 'array', 'items': {'type': 'string'}, 'description': 'Column names to return (default: all)'}
+FILTERS = {'type': 'array', 'description': 'Row conditions', 'items': schema(
+    column={'type': 'string'},
+    op={'type': 'string', 'description': ' '.join(FILTER_OPS)},
+    value={'description': 'Text, number, or date as YYYY-MM-DD'},
+    values={'type': 'array', 'description': 'For in / not_in, or [low, high] for between'})}
+MATCH = {'type': 'string', 'description': 'all (AND, default) or any (OR)'}
+DESCRIBE_SCHEMA = schema(sheet=SHEET, columns=COLUMNS)
+READ_SCHEMA = schema(sheet=SHEET, start={'description': 'First row number, 1-based'},
+                     count={'description': f'Rows to return, at most {MAX_MODEL_ROWS}'}, columns=COLUMNS)
+FIND_SCHEMA = schema(sheet=SHEET, filters=FILTERS, match=MATCH, columns=COLUMNS,
+                     sort_by={'type': 'string', 'description': 'Column to sort by'},
+                     descending={'description': 'true for largest first'},
+                     limit={'description': f'Rows shown to you, at most {MAX_MODEL_ROWS}'})
+AGGREGATE_SCHEMA = schema(
+    sheet=SHEET,
+    metrics={'type': 'array', 'description': 'e.g. [{"op": "sum", "column": "Amount"}]; op: ' + ' '.join(METRIC_OPS)
+             + '. Omit column for a row count. Default: row count.',
+             'items': schema(op={'type': 'string'}, column={'type': 'string'})},
+    group_by={'type': 'array', 'items': {'type': 'string'}, 'description': 'Up to 3 columns'},
+    time_grain={'type': 'string', 'description': 'day, week, month, quarter or year: buckets dates in group_by'},
+    filters=FILTERS, match=MATCH,
+    sort_by={'type': 'string', 'description': 'A metric label like sum(Amount), or a group column'},
+    descending={'description': 'Default true'},
+    limit={'description': f'Groups shown to you, at most {MAX_MODEL_GROUPS}'})
+SQL_SCHEMA = schema(sql={'type': 'string', 'description': 'One read-only SQLite SELECT statement'})
 
 
 @dataclass
@@ -269,13 +320,12 @@ class Toolkit:
         return pd.Series(COMPARE[op](left, right), index=series.index).fillna(False).astype(bool)
 
     def filtered(self, frame, filters, match, sid):
-        filters = [Filter.model_validate(f) if isinstance(f, dict) else f for f in filters]
         if not filters:
             return frame
         masks = [self.condition(frame, flt, sid) for flt in filters]
         combined = masks[0]
         for mask in masks[1:]:
-            combined = combined & mask if match == 'all' else combined | mask
+            combined = combined | mask if str(match).casefold() in ('any', 'or') else combined & mask
         return frame[combined]
 
     @staticmethod
@@ -287,11 +337,12 @@ class Toolkit:
                 return f'{flt.column} {flt.op.replace("_", " ")}'
             value = ', '.join(flt.values) if flt.values else flt.value
             return f'{flt.column} {flt.op.replace("_", " ")} {value}'
-        return ' where ' + (' and ' if match == 'all' else ' or ').join(map(one, filters))
+        return ' where ' + (' or ' if str(match).casefold() in ('any', 'or') else ' and ').join(map(one, filters))
 
     # Tools ------------------------------------------------------------------------------------------
-    def describe_sheet(self, sheet, columns=()):
+    def describe_sheet(self, sheet='', columns=()):
         sid, frame = self.sheet(sheet)
+        columns = as_list(columns)
         selected = [self.column(frame, c, sid) for c in columns] or list(frame.columns[:25])
         described = []
         for name in selected:
@@ -301,7 +352,9 @@ class Toolkit:
             info = {'name': name, 'type': column_kind(series), 'missing': int(missing.sum())}
             if info['type'] == 'number' and len(present):
                 values = numeric(present).dropna()
-                if len(values):
+                if len(values) and (values % 1 == 0).all() and values.abs().median() >= 1e8:
+                    info.update(identifier=True, examples=[cell(v) for v in values.head(2)])
+                elif len(values):
                     info.update(min=cell(values.min()), max=cell(values.max()), mean=cell(values.mean()))
                 if len(values) < len(present):
                     info['non_numeric_values'] = int(len(present) - len(values))
@@ -327,11 +380,11 @@ class Toolkit:
                                f'{len(selected)} of {len(frame.columns)} columns, {len(frame):,} rows'))
         return compact(payload, MAX_OUTPUT_CHARS)
 
-    def read_rows(self, sheet, start=1, count=5, columns=()):
+    def read_rows(self, sheet='', start=1, count=5, columns=()):
         sid, frame = self.sheet(sheet)
-        start = max(1, int(start))
-        count = max(1, min(int(count), MAX_MODEL_ROWS))
-        selected = [self.column(frame, c, sid) for c in columns] or list(frame.columns)
+        start = max(1, as_int(start, 1))
+        count = max(1, min(as_int(count, 5), MAX_MODEL_ROWS))
+        selected = [self.column(frame, c, sid) for c in as_list(columns)] or list(frame.columns)
         window = frame[selected].iloc[start - 1:start - 1 + count]
         payload = {'sheet': sid, 'total_rows': len(frame), 'first_row': start,
                    'columns': selected, 'rows': records(window, count), 'shown': len(window)}
@@ -339,35 +392,45 @@ class Toolkit:
                                f'{len(window)} of {len(frame):,} rows'))
         return encode(payload)
 
-    def find_rows(self, sheet, filters=(), match='all', columns=(), sort_by='', descending=False, limit=10):
+    def find_rows(self, sheet='', filters=(), match='all', columns=(), sort_by='', descending=False, limit=10):
         sid, frame = self.sheet(sheet)
-        filters = [Filter.model_validate(f) if isinstance(f, dict) else f for f in filters]
+        filters = parse_items(Filter, filters, 'filter')
         found = self.filtered(frame, filters, match, sid)
+        descending = as_bool(descending, False)
         if sort_by:
             key = self.column(frame, sort_by, sid)
             kind = column_kind(frame[key])
             sorter = numeric if kind == 'number' else as_dates if kind == 'date' else text
             found = found.sort_values(key, ascending=not descending, na_position='last', key=sorter, kind='stable')
-        selected = [self.column(frame, c, sid) for c in columns] or list(frame.columns)
+        selected = [self.column(frame, c, sid) for c in as_list(columns)] or list(frame.columns)
         view = found[selected]
-        limit = max(1, min(int(limit), MAX_MODEL_ROWS))
+        limit = max(1, min(as_int(limit, 10), MAX_MODEL_ROWS))
         payload = {'sheet': sid, 'rows_scanned': len(frame), 'matched': len(found),
                    'columns': selected, 'rows': records(view, limit), 'shown': min(limit, len(found))}
         if len(found) > payload['shown']:
             payload['note'] = (f'Only {payload["shown"]} of {len(found):,} matching rows are shown to you. '
                                'The user sees all of them in a table under your answer.')
+        blank = int(view.apply(missing_mask).all(axis=1).sum()) if len(view) else 0
+        if blank:
+            payload['warning'] = (f'{blank} matched rows are empty in every returned column; they may be blank '
+                                  'or template rows. Mention this instead of listing them as records.')
         self.steps.append(Step(f'Searched {self.workbook.labels[sid]}{self.where(filters, match)}',
                                f'{len(found):,} of {len(frame):,} rows matched',
                                view.head(MAX_RESULT_ROWS).reset_index(drop=True)))
         return encode(payload)
 
-    def aggregate(self, sheet, metrics=(), group_by=(), time_grain='none', filters=(), match='all',
+    def aggregate(self, sheet='', metrics=(), group_by=(), time_grain='none', filters=(), match='all',
                   sort_by='', descending=True, limit=20):
         sid, frame = self.sheet(sheet)
+        group_by = as_list(group_by)
         if len(group_by) > 3:
             raise ToolError('Group by at most 3 columns.')
-        metrics = [Metric.model_validate(m) if isinstance(m, dict) else m for m in metrics] or [Metric(op='count')]
-        filters = [Filter.model_validate(f) if isinstance(f, dict) else f for f in filters]
+        metrics = parse_items(Metric, metrics, 'metric') or [Metric(op='count')]
+        filters = parse_items(Filter, filters, 'filter')
+        descending = as_bool(descending, True)
+        time_grain = str(time_grain or 'none').strip().casefold()
+        if time_grain not in GRAINS:
+            time_grain = 'none'
         found = self.filtered(frame, list(filters), match, sid)
         work, keys, notes, timed = pd.DataFrame(index=found.index), [], [], False
         for name in group_by:
@@ -427,7 +490,7 @@ class Toolkit:
         elif keys:
             result = result.sort_values(labels[0], ascending=False, na_position='last', kind='stable')
         result = result.reset_index(drop=True)
-        limit = max(1, min(int(limit), MAX_MODEL_GROUPS))
+        limit = max(1, min(as_int(limit, 20), MAX_MODEL_GROUPS))
         payload = {'sheet': sid, 'rows_scanned': len(frame), 'rows_matched': len(found)}
         if keys:
             payload.update(groups=len(result), columns=list(result.columns), rows=records(result, limit),
@@ -446,7 +509,9 @@ class Toolkit:
                                result.head(MAX_RESULT_ROWS), chart=chart))
         return encode(payload)
 
-    def sql_query(self, sql):
+    def sql_query(self, sql=''):
+        if not str(sql).strip():
+            raise ToolError('Provide one SELECT statement in sql.')
         result = self.workbook.store.query(sql, set(self.ids))
         frame = result.frame
         payload = {'rows_returned': len(frame), 'columns': list(frame.columns),
@@ -462,7 +527,10 @@ class Toolkit:
 
     # LangChain wrappers ----------------------------------------------------------------------------
     def guarded(self, function, title):
+        accepted = set(inspect.signature(function).parameters)
         def run(**kwargs):
+            # Unknown arguments are ignored rather than failing the call.
+            kwargs = {key: value for key, value in kwargs.items() if key in accepted and value is not None}
             try:
                 return function(**kwargs)
             except (ToolError, QueryExecutionError) as exc:
@@ -475,22 +543,22 @@ class Toolkit:
 
     def tools(self):
         specs = [
-            ('describe_sheet', self.describe_sheet, DescribeArgs,
+            ('describe_sheet', self.describe_sheet, DESCRIBE_SCHEMA,
              'Column types, missing counts, min/max/mean, most common values and 3 sample rows. '
              'Use it to learn exact category spellings and formats before filtering.'),
-            ('read_rows', self.read_rows, ReadArgs,
+            ('read_rows', self.read_rows, READ_SCHEMA,
              f'Peek at up to {MAX_MODEL_ROWS} rows by position to understand the layout. Never page through a sheet.'),
-            ('find_rows', self.find_rows, FindArgs,
+            ('find_rows', self.find_rows, FIND_SCHEMA,
              'Filter every row of a sheet and list matches. Returns the exact match count and a few rows; the user '
              'gets the full list. Text matching ignores case. Use sort_by + descending + limit for top/bottom N.'),
-            ('aggregate', self.aggregate, AggregateArgs,
+            ('aggregate', self.aggregate, AGGREGATE_SCHEMA,
              'count / count_distinct / sum / mean / median / min / max / std over every row, optionally filtered and '
              'grouped (time_grain buckets dates). Use for totals, averages, breakdowns, rankings and distributions.'),
-            ('sql_query', self.sql_query, SqlArgs,
+            ('sql_query', self.sql_query, SQL_SCHEMA,
              'Read-only SQLite SELECT over all sheets (table = sheet id; double-quote column names). Use only for '
              'joins, calculated columns, date maths, HAVING or window functions. Dates are text YYYY-MM-DD. '
              'to_number(x) parses numeric text; is_missing(x)=1 for blank/NA cells.'),
         ]
         return [StructuredTool.from_function(func=self.guarded(function, name.replace('_', ' ')), name=name,
-                                             description=description, args_schema=schema)
-                for name, function, schema, description in specs]
+                                             description=description, args_schema=args)
+                for name, function, args, description in specs]

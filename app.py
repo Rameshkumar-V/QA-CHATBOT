@@ -250,6 +250,9 @@ else:
             frame = workbook.frames[sid]
             with tab:
                 st.caption(f'{len(frame):,} rows × {len(frame.columns)} columns · showing the first 100 rows')
+                if frame.attrs.get('notes'):
+                    st.caption(f'{len(frame.attrs["notes"])} line(s) of text below the table (notes, signatures) '
+                               'are not counted as records.')
                 if 'header_row' in frame.attrs:
                     header = frame.attrs['header_row']
                     if frame.attrs.get('generic_headers'):

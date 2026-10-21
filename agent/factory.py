@@ -13,10 +13,14 @@ MODELS = {
     'qwen/qwen3.8-27b': 'Preview',
 }
 DEFAULT_MODEL = next(iter(MODELS))
-MAX_OUTPUT_TOKENS = 2048
+MAX_OUTPUT_TOKENS = 4096
 
 
 def build_model(model_name, api_key):
-    extra = {'reasoning_effort': 'low'} if model_name.startswith('openai/gpt-oss') else {}
+    extra = {}
+    if model_name.startswith('openai/gpt-oss'):
+        # Medium reasoning produces noticeably fewer malformed tool calls than low.
+        extra = {'reasoning_effort': 'medium'}
     return ChatOpenAI(model=model_name, api_key=api_key, base_url=GROQ_BASE_URL, use_responses_api=False,
-                      timeout=REQUEST_TIMEOUT, max_retries=0, max_tokens=MAX_OUTPUT_TOKENS, **extra)
+                      temperature=0.2, timeout=REQUEST_TIMEOUT, max_retries=0, max_tokens=MAX_OUTPUT_TOKENS,
+                      **extra)

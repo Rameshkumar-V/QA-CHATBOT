@@ -28,6 +28,7 @@ class ScriptedModel(BaseChatModel):
     seen: list = Field(default_factory=list)
     tool_choices: list = Field(default_factory=list)
     choice: object = None
+    rejections: int = 0
 
     @property
     def _llm_type(self):
@@ -40,6 +41,9 @@ class ScriptedModel(BaseChatModel):
     def _generate(self, messages, stop=None, run_manager=None, **kwargs):
         self.seen.append(messages)
         self.tool_choices.append(self.choice)
+        if self.rejections:
+            self.rejections -= 1
+            raise GroqRejection()
         if self.script and self.choice != 'none':
             name, args = self.script.pop(0)
             output = AIMessage('', tool_calls=[{'name': name, 'args': args, 'id': f'call{len(self.seen)}'}])
@@ -47,6 +51,16 @@ class ScriptedModel(BaseChatModel):
             result = json.loads(messages[-1].content) if isinstance(messages[-1], ToolMessage) else {}
             output = AIMessage(f'Answer from data: {json.dumps(result)}')
         return ChatResult(generations=[ChatGeneration(message=output)])
+
+
+class GroqRejection(Exception):
+    """Shape of the openai.BadRequestError GroqCloud returns for a malformed tool call."""
+    status_code = 400
+    body = {'error': {'code': 'tool_use_failed', 'failed_generation': 'private cell value',
+                      'message': "tool call validation failed: attempted to call tool 'python' which was not in request.tools"}}
+
+    def __str__(self):
+        return 'Error code: 400 - tool_use_failed'
 
 
 def student_workbook():
@@ -70,8 +84,9 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"matched": 8', answer.text)
         self.assertEqual(len(model.seen), 3)
         sent = ''.join(str(m.content) for call in model.seen for m in call)
-        self.assertNotIn('Student 1100', sent)  # rows beyond the bounded results never reach the model
-        self.assertIn('1,200 rows', sent)  # the overview is in the system prompt
+        self.assertNotIn('Student 1100', sent)  # large sheets are never sent whole
+        self.assertNotIn('rows (CSV)', sent)
+        self.assertIn('1,200 data rows', sent)  # the overview is in the system prompt
         self.assertEqual(len(answer.steps[-1].frame), 8)
         self.assertTrue(any('8 of 1,200 rows matched' in line for line in progress))
         workbook.close()
@@ -83,6 +98,32 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(model.seen), MAX_MODEL_CALLS)
         self.assertEqual(model.tool_choices[-1], 'none')
         self.assertTrue(answer.text.startswith('Answer from data'))
+        workbook.close()
+
+    async def test_rejected_tool_call_is_retried_with_the_reason(self):
+        workbook = student_workbook()
+        model = ScriptedModel(rejections=2, script=[('aggregate', {'metrics': [{'op': 'count'}]})])
+        answer = await answer_question(model, workbook, [{'role': 'user', 'content': 'How many students?'}])
+        self.assertIn('"count": 1200', answer.text)
+        retry_prompt = model.seen[2][0].content
+        self.assertIn("attempted to call tool 'python'", retry_prompt)
+        self.assertNotIn('private cell value', retry_prompt)
+        workbook.close()
+
+    async def test_repeated_rejections_surface_a_clear_error(self):
+        workbook = student_workbook()
+        with self.assertRaises(GroqRejection) as caught:
+            await answer_question(ScriptedModel(rejections=5), workbook, [{'role': 'user', 'content': 'x'}])
+        self.assertIn('rejected', friendly_error(caught.exception))
+        workbook.close()
+
+    async def test_small_sheet_is_answered_from_the_overview(self):
+        workbook = Workbook({'class.csv': pd.DataFrame({'Name': ['Monisha', 'Arun'], 'Aadhar Number': ['8235 9649 8073', None]})})
+        model = ScriptedModel()
+        await answer_question(model, workbook, [{'role': 'user', 'content': 'Aadhaar of Monisha?'}])
+        prompt = model.seen[0][0].content
+        self.assertIn('all 2 rows (CSV)', prompt)
+        self.assertIn('Monisha,8235 9649 8073', prompt)
         workbook.close()
 
     async def test_deadline_cancels_a_stalled_model(self):
@@ -126,7 +167,7 @@ class ModelTests(unittest.TestCase):
     def test_groq_client_is_bounded(self):
         model = build_model(DEFAULT_MODEL, 'test-key')
         self.assertEqual(model.max_retries, 0)
-        self.assertEqual(model.reasoning_effort, 'low')
+        self.assertEqual(model.reasoning_effort, 'medium')
         self.assertIn('groq.com', str(model.openai_api_base))
 
     def test_provider_errors_do_not_leak_details(self):

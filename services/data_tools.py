@@ -114,6 +114,9 @@ def infer_types(df: pd.DataFrame) -> pd.DataFrame:
             df[column] = pd.to_datetime(df[column].where(~missing_mask(df[column])), errors='coerce',
                                         dayfirst=dayfirst, format='mixed')
             continue
+        if values.str.match(r'^[-+]?\d+(?:\.\d+)?$').all() and not values.str.match(r'^[-+]?0\d').any():
+            df[column] = pd.to_numeric(df[column].where(~missing_mask(df[column])), errors='coerce')
+            continue
         formatted = values.str.contains(r'[,₹$€£]')
         cleaned = values.str.replace(r'[\s,₹$€£]', '', regex=True)
         leading_zero = cleaned.str.match(r'^[-+]?0\d')
@@ -121,6 +124,35 @@ def infer_types(df: pd.DataFrame) -> pd.DataFrame:
             df[column] = pd.to_numeric(df[column].where(~missing_mask(df[column]))
                                        .astype('string').str.replace(r'[\s,₹$€£]', '', regex=True), errors='coerce')
     return df
+
+
+def split_notes(df: pd.DataFrame):
+    """Separate trailing note/signature lines from data rows.
+
+    A footer is a block of rows at the end that fill only a few cells while typical
+    rows fill many, e.g. "To be certified by the class in charge" under a register.
+    """
+    if len(df) < 3 or len(df.columns) < 3:
+        return df, []
+    filled = (~df.apply(missing_mask)).sum(axis=1)
+    typical = filled.median()
+    if typical < 3:
+        return df, []
+    sparse = filled <= max(1, typical // 3)
+    end = len(df)
+    while end > 0 and sparse.iloc[end - 1]:
+        end -= 1
+    if end == len(df) or end < len(df) / 2:
+        return df, []
+    notes = []
+    for row in df.iloc[end:].itertuples(index=False, name=None):
+        text = ' '.join(re.sub(r'\s+', ' ', str(v)).strip() for v in row
+                        if not (pd.api.types.is_scalar(v) and pd.isna(v)) and str(v).strip())
+        if text:
+            notes.append(text[:300])
+    data = df.iloc[:end]
+    empty = [c for c in data.columns if missing_mask(data[c]).all()]
+    return data.drop(columns=empty).reset_index(drop=True), notes
 
 
 def _read_csv(raw, suffix):
@@ -161,8 +193,11 @@ def read_upload(file, excel_headers=None) -> dict[str, pd.DataFrame]:
         if len(df) > MAX_ROWS:
             raise ValueError(f'{name}: maximum {MAX_ROWS:,} rows per table')
         attrs = dict(df.attrs)
-        df = infer_types(sanitize_dataframe(df))
-        df.attrs.update(attrs)
+        df, notes = split_notes(sanitize_dataframe(df))
+        df = infer_types(df.copy())
+        df.attrs.update(attrs, notes=notes)
+        if 'generic_headers' in attrs:
+            df.attrs['generic_headers'] = [c for c in attrs['generic_headers'] if c in df.columns]
         tables[name] = df
     return tables
 

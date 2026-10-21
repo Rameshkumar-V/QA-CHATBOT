@@ -116,6 +116,18 @@ class ToolkitTests(unittest.TestCase):
         self.assertEqual(result['rows'][0][1], self.frame.groupby('Region').Amount.sum().max())
         self.assertTrue(self.toolkit.steps[-1].sql)
 
+    def test_loose_arguments_from_small_models_still_work(self):
+        result = self.call('aggregate', metrics='sum(Amount)', group_by='Region', descending='true', limit='2',
+                           unexpected='ignored', sheet='Orders')
+        self.assertEqual(result['shown'], 2)
+        result = self.call('find_rows', filters=[{'column': 'notes', 'operator': 'is null'}], columns='Order ID',
+                           sheet='sales_orders')
+        self.assertEqual(result['matched'], 3)
+        self.assertIn('empty in every returned column', self.call(
+            'find_rows', sheet='sales_orders', filters=[{'column': 'Notes', 'op': 'is_missing'}], columns=['Notes'])['warning'])
+        self.assertIn('unknown op', self.call('find_rows', sheet='sales_orders',
+                                              filters=[{'column': 'Amount', 'op': 'approx', 'value': 1}])['error'])
+
     def test_scope_limits_sheets(self):
         toolkit = Toolkit(self.workbook, ['regions'])
         tools = {tool.name: tool for tool in toolkit.tools()}
@@ -170,6 +182,31 @@ class LoaderTests(unittest.TestCase):
     def test_case_insensitive_duplicate_headers_are_unique(self):
         frame = self.upload('Name,name,NAME\n1,2,3\n')
         self.assertEqual(frame.columns.tolist(), ['Name', 'name (2)', 'NAME (3)'])
+
+    def test_footer_notes_and_signatures_are_not_records(self):
+        from openpyxl import Workbook as Book
+        book = Book()
+        book.active.append(['Register of students'])
+        book.active.append(['S.No', 'Register Number', 'Name', 'Aadhar Number', 'Date of Birth', 'Signature'])
+        for n in range(1, 30):
+            book.active.append([n, f'R{n:03}', f'Student {n}', f'8235 9649 {8000 + n}', f'{n % 28 + 1:02}/05/2004'])
+        book.active.append([None, 'Details are to be checked and certified by the Class in charge.'])
+        book.active.append([None, None, None, 'Signature of the Class incharge'])
+        upload = io.BytesIO()
+        book.save(upload)
+        upload.name = 'class.xlsx'
+        frame = next(iter(read_upload(upload).values()))
+        self.assertEqual(len(frame), 29)
+        self.assertEqual(len(frame.attrs['notes']), 2)
+        self.assertNotIn('Signature', frame.columns)  # empty once the footer is removed
+        self.assertTrue(pd.api.types.is_datetime64_any_dtype(frame['Date of Birth']))
+        self.assertEqual(frame['Aadhar Number'].iloc[0], '8235 9649 8001')  # identifier stays text
+        self.assertTrue(pd.api.types.is_numeric_dtype(frame['S.No']))
+        workbook = Workbook({'class.xlsx :: Sheet': frame})
+        overview = workbook.overview()
+        self.assertIn('29 data rows', overview)
+        self.assertIn('not data rows', overview)
+        workbook.close()
 
     def test_other_formats_are_rejected(self):
         with self.assertRaisesRegex(ValueError, 'Excel'):
