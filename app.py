@@ -21,7 +21,7 @@ def _width_kwarg(stretch: bool = True) -> dict:
 
 WIDE = _width_kwarg(True)
 
-DEFAULT_MODELS = {'GroqCloud': 'openai/gpt-oss-20b', 'Gemini': 'gemini-2.5-flash', 'OpenAI': 'gpt-4.1-mini', 'Grok (xAI)': 'grok-4-1-fast-non-reasoning'}
+DEFAULT_MODELS = {'GroqCloud': 'openai/gpt-oss-120b', 'Gemini': 'gemini-2.5-flash', 'OpenAI': 'gpt-4.1-mini', 'Grok (xAI)': 'grok-4-1-fast-non-reasoning'}
 SERVICE_KEYS = {'Gemini': 'gemini', 'OpenAI': 'openai', 'Grok (xAI)': 'grok', 'GroqCloud': 'groqcloud'}
 
 

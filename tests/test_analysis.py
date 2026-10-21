@@ -191,7 +191,7 @@ class ErrorTests(unittest.TestCase):
         self.assertIn('context', friendly_error(ContextBudgetError()))
 
     def test_groq_defaults_use_bounded_requests(self):
-        model = build_model('GroqCloud', 'openai/gpt-oss-20b', 'test-key')
+        model = build_model('GroqCloud', 'openai/gpt-oss-120b', 'test-key')
         self.assertEqual(model.max_retries, 0)
         self.assertEqual(model.max_tokens, 1200)
         self.assertEqual(model.request_timeout, 20)

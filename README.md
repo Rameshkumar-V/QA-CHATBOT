@@ -2,7 +2,7 @@
 
 Local Streamlit UI + LangChain read-only data agent using user-provided Gemini, OpenAI, xAI (Grok) or GroqCloud API keys.
 
-Default: **GroqCloud** with **`openai/gpt-oss-20b`**, using a Groq API key. Other providers and models remain selectable. Groq model and tool support: https://console.groq.com/docs/tool-use/overview
+Default: **GroqCloud** with **`openai/gpt-oss-120b`**, using a Groq API key. Other providers and models remain selectable. Groq model and tool support: https://console.groq.com/docs/tool-use/overview
 
 ## Deploy on Streamlit Community Cloud
 
@@ -90,4 +90,4 @@ Build from Windows 10 x64 using Python 3.11 to target Windows 10 and Windows 11 
 
 ## GroqCloud vs xAI Grok
 
-GroqCloud and xAI Grok are separate services with incompatible API keys. Select **GroqCloud** for keys from https://console.groq.com/keys (endpoint `https://api.groq.com/openai/v1`); select **Grok (xAI)** for keys from https://console.x.ai (endpoint `https://api.x.ai/v1`). Set the model to one supported by your provider. GroqCloud default: `openai/gpt-oss-20b`.
+GroqCloud and xAI Grok are separate services with incompatible API keys. Select **GroqCloud** for keys from https://console.groq.com/keys (endpoint `https://api.groq.com/openai/v1`); select **Grok (xAI)** for keys from https://console.x.ai (endpoint `https://api.x.ai/v1`). Set the model to one supported by your provider. GroqCloud default: `openai/gpt-oss-120b`.
