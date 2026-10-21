@@ -8,7 +8,7 @@ from streamlit.testing.v1 import AppTest
 
 from services.data_tools import excel_previews, read_upload
 from services.excel_headers import column_names, read_sheet
-from services.table_store import TableStore
+from services.workbook import Workbook as SheetBook
 import pandas as pd
 
 
@@ -36,10 +36,10 @@ class ExcelHeaderTests(unittest.TestCase):
         self.assertEqual(frame.columns.tolist(), labels)
         self.assertEqual(frame.shape, (43, 9))
         self.assertEqual(frame.attrs['header_row'], 3)
-        store = TableStore(tables)
-        self.assertEqual([c['name'] for c in store.catalog['T0']['columns']], labels)
-        self.assertEqual(store.query('SELECT COUNT(*) AS n FROM T0').frame.iloc[0]['n'], 43)
-        store.close()
+        workbook = SheetBook(tables)
+        self.assertEqual(workbook.frames['report_sheet'].columns.tolist(), labels)
+        self.assertEqual(workbook.store.query('SELECT COUNT(*) AS n FROM report_sheet').frame.iloc[0]['n'], 43)
+        workbook.close()
 
     def test_regular_text_only_table_does_not_lose_first_record(self):
         upload = workbook_upload([['Product', 'Location'], ['Pencil', 'North'], ['Eraser', 'South']])
@@ -116,7 +116,7 @@ class ExcelHeaderTests(unittest.TestCase):
         with patch('streamlit.file_uploader', return_value=[upload]):
             app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / 'app.py')).run(timeout=30)
             self.assertEqual(len(app.exception), 0)
-            self.assertEqual(app.session_state['tables']['report.xlsx :: Sheet'].columns.tolist(), ['Code', 'Value'])
+            self.assertEqual(app.session_state['workbook'].frames['report_sheet'].columns.tolist(), ['Code', 'Value'])
             app.session_state['messages'] = [{'role': 'user', 'content': 'Old schema question'},
                                              {'role': 'assistant', 'content': 'Old schema answer'}]
             next(w for w in app.selectbox if w.label == 'Header mode').select('Select header row').run()
@@ -124,6 +124,6 @@ class ExcelHeaderTests(unittest.TestCase):
             self.assertFalse(app.session_state['messages'])
             next(w for w in app.number_input if w.label == 'Header starts at Excel row').set_value(3).run()
             self.assertEqual(len(app.exception), 0)
-            catalog = app.session_state['table_store'].catalog['T0']
-            self.assertEqual([c['name'] for c in catalog['columns']], ['Code', 'Value'])
-            self.assertEqual(catalog['header']['header_row'], 3)
+            frame = app.session_state['workbook'].frames['report_sheet']
+            self.assertEqual(frame.columns.tolist(), ['Code', 'Value'])
+            self.assertEqual(frame.attrs['header_row'], 3)

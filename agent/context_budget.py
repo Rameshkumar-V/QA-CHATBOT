@@ -8,19 +8,20 @@ from langchain_core.utils.function_calling import convert_to_openai_tool
 from services.analysis import ContextBudgetError, MAX_MODEL_CALLS
 from services.data_tools import compact
 
-DEFAULT_INPUT_TOKENS = 6000
+DEFAULT_INPUT_TOKENS = 12000
+BYTES_PER_TOKEN = 3
 
 
 def request_size(request, messages):
-    """Conservative UTF-8 byte budget, including schema and message overhead.
+    """Estimated input tokens, including tool schemas and message overhead.
 
-    Byte-level tokenizers cannot use more tokens than their input bytes. Additional
-    per-message/tool overhead is reserved rather than relying on a model tokenizer.
+    Tokenizers average about four UTF-8 bytes per token for English and JSON; three keeps
+    a margin for other scripts without needing a provider tokenizer.
     """
     all_messages = ([request.system_message] if request.system_message else []) + messages
     payload = {'messages': convert_to_openai_messages(all_messages),
                'tools': [convert_to_openai_tool(t) for t in request.tools]}
-    return len(json.dumps(payload, ensure_ascii=False, default=str).encode('utf-8')) + 512
+    return len(json.dumps(payload, ensure_ascii=False, default=str).encode('utf-8')) // BYTES_PER_TOKEN + 200
 
 
 def fit_request(request, budget):

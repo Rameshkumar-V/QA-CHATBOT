@@ -1,6 +1,7 @@
-"""A session-local SQLite store that can only read uploaded tables."""
+"""A session-local SQLite copy of the sheets that can only be read."""
 from dataclasses import dataclass
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -24,18 +25,24 @@ class TableResult:
     truncated: bool
 
 
+def to_number(value):
+    if value is None or isinstance(value, (int, float)):
+        return value
+    text = re.sub(r'[\s,₹$€£%]', '', str(value))
+    if text.casefold() in MISSING_MARKERS:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
 class TableStore:
-    def __init__(self, tables):
-        self.tables = tables
+    """Tables are named by sheet ID and keep their original column names."""
+    def __init__(self, frames):
+        self.frames = frames
         self.connection = None
         self.lock = threading.RLock()
-        self.catalog = {f'T{i}': {'name': name, 'rows': len(frame), 'columns': [
-            {'id': f'C{j}', 'name': str(column), 'type': str(frame.iloc[:, j].dtype)}
-            for j, column in enumerate(frame.columns)]} for i, (name, frame) in enumerate(tables.items())}
-        for alias, frame in zip(self.catalog, tables.values()):
-            if 'header_row' in frame.attrs:
-                self.catalog[alias]['header'] = {key: frame.attrs[key] for key in
-                    ('header_row', 'header_rows', 'header_mode', 'generic_headers') if key in frame.attrs}
 
     def close(self):
         with self.lock:
@@ -50,22 +57,17 @@ class TableStore:
         try:
             connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 2 * 1024 * 1024)
             connection.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, 20_000)
-            for alias, (_, frame) in zip(self.catalog, self.tables.items()):
+            for name, frame in self.frames.items():
                 local = frame.copy()
-                local.columns = [c['id'] for c in self.catalog[alias]['columns']]
                 for column in local.columns:
                     if local[column].dtype == 'object':
                         local[column] = local[column].map(lambda value: json.dumps(value, default=str)
                             if isinstance(value, (dict, list, tuple)) else value)
-                local.insert(0, '__row_number', range(1, len(local) + 1))
-                local.to_sql(alias, connection, index=False)
+                    elif pd.api.types.is_datetime64_any_dtype(local[column]):
+                        local[column] = local[column].dt.strftime('%Y-%m-%d %H:%M:%S').str.replace(' 00:00:00', '')
+                local.to_sql(name, connection, index=False)
             def is_missing(value):
                 return int(value is None or str(value).strip().casefold() in MISSING_MARKERS)
-            def to_number(value):
-                try:
-                    return float(value) if not is_missing(value) else None
-                except (TypeError, ValueError):
-                    return None
             connection.create_function('is_missing', 1, is_missing, deterministic=True)
             connection.create_function('to_number', 1, to_number, deterministic=True)
             connection.execute('PRAGMA query_only = ON')
@@ -78,9 +80,9 @@ class TableStore:
             raise
 
     def query(self, sql, allowed_tables=None, timeout=3):
-        allowed = set(self.catalog) if allowed_tables is None else set(allowed_tables)
-        if not allowed.issubset(self.catalog):
-            raise QueryExecutionError('The selected dataset scope is invalid.')
+        allowed = set(self.frames) if allowed_tables is None else set(allowed_tables)
+        if not allowed.issubset(self.frames):
+            raise QueryExecutionError('The selected sheet scope is invalid.')
         used = set()
         def authorize(action, arg1, arg2, database, trigger):
             if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_RECURSIVE):
@@ -100,10 +102,10 @@ class TableStore:
             try:
                 cursor = self.connection.execute(sql)
                 if not used:
-                    raise QueryExecutionError('A query must read at least one uploaded table.')
+                    raise QueryExecutionError('A query must read at least one sheet.')
                 records, size, truncated = [], 0, False
                 columns = [col[0] for col in cursor.description]
-                if len(set(columns)) != len(columns):
+                if len({c.casefold() for c in columns}) != len(columns):
                     raise QueryExecutionError('Use unique aliases for result columns.')
                 for row in cursor:
                     size += sum(len(str(value).encode('utf-8')) for value in row)
@@ -112,17 +114,17 @@ class TableStore:
                         break
                     records.append(row)
                 return TableResult(pd.DataFrame.from_records(records, columns=columns),
-                                   [self.catalog[alias]['name'] for alias in self.catalog if alias in used], truncated)
+                                   [name for name in self.frames if name in used], truncated)
             except sqlite3.Error as exc:
                 if time.monotonic() >= deadline:
-                    raise QueryExecutionError('Query execution timed out. Narrow the request or simplify the calculation.') from exc
-                # These are validation diagnostics; no provider response or row contents are included.
+                    raise QueryExecutionError('Query timed out. Narrow the request or simplify the calculation.') from exc
                 if isinstance(exc, sqlite3.ProgrammingError):
-                    message = 'Use one read-only SQL statement.'
+                    message = 'Use one read-only SELECT statement.'
                 elif 'authoriz' in str(exc).lower() or 'prohibited' in str(exc).lower():
-                    message = 'Only read-only queries against the selected uploaded tables are allowed.'
+                    message = 'Only read-only queries against the loaded sheets are allowed.'
                 else:
-                    message = 'SQL could not be validated. Check SQLite syntax, table IDs, column IDs and functions.'
+                    # SQLite diagnostics name tables/columns, never row contents.
+                    message = f'SQL error: {exc}. Use sheet IDs as table names and double-quote column names.'
                 raise QueryExecutionError(message) from exc
             finally:
                 if cursor is not None:

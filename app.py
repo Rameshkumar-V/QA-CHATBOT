@@ -1,139 +1,172 @@
-"""Personal AI Data Agent: Streamlit + LangChain 1.x."""
+"""Data QA Agent: ask questions about Excel and CSV files."""
+import asyncio
+import inspect
 import json
 import os
-
-import inspect
-import asyncio
 import time
 
+import pandas as pd
 import streamlit as st
-
-from services.data_tools import read_upload, sanitize_dataframe, MAX_TOTAL_BYTES, excel_previews
 from openpyxl.utils import get_column_letter
-from agent.factory import build_model
+
+from agent.context_budget import DEFAULT_INPUT_TOKENS
+from agent.factory import DEFAULT_MODEL, GROQ_KEY_URL, MODELS, build_model
+from agent.qa_agent import answer_question
+from services.analysis import friendly_error
 from services.context import bounded_chat
-from services.analysis import friendly_error, ANALYSIS_TIMEOUT
-from services.search import DocumentSearch
-from services.query_planner import run_query
-from services.table_store import TableStore
+from services.data_tools import MAX_TOTAL_BYTES, SUPPORTED_TYPES, excel_previews, read_upload, sanitize_dataframe
+from services.workbook import Workbook, column_kind
+
 
 def _width_kwarg(stretch: bool = True) -> dict:
     if 'width' in inspect.signature(st.button).parameters:
         return {'width': 'stretch' if stretch else 'content'}
     return {'use_container_width': stretch}
 
+
 WIDE = _width_kwarg(True)
-
-DEFAULT_MODELS = {'GroqCloud': 'openai/gpt-oss-120b', 'Gemini': 'gemini-2.5-flash', 'OpenAI': 'gpt-4.1-mini', 'Grok (xAI)': 'grok-4-1-fast-non-reasoning'}
-SERVICE_KEYS = {'Gemini': 'gemini', 'OpenAI': 'openai', 'Grok (xAI)': 'grok', 'GroqCloud': 'groqcloud'}
+SECRET_NAME = 'GROQ_API_KEY'
 
 
-def load_config():
-    return st.session_state.get('settings', {})
-
-
-def save_config(config):
-    st.session_state.settings = config
-
-
-def load_key(provider):
-    if st.session_state.get('temp_keys', {}).get(provider):
-        return st.session_state.temp_keys[provider]
-    secret_names = {'Gemini': 'GOOGLE_API_KEY', 'OpenAI': 'OPENAI_API_KEY',
-                    'Grok (xAI)': 'XAI_API_KEY', 'GroqCloud': 'GROQ_API_KEY'}
-    name = secret_names[provider]
+def load_key():
     try:
-        secret = st.secrets.get(name, '')
+        secret = st.secrets.get(SECRET_NAME, '')
     except (FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
         secret = ''
-    if secret or os.environ.get(name):
-        return secret or os.environ[name]
+    if secret or os.environ.get(SECRET_NAME):
+        return secret or os.environ[SECRET_NAME]
     if os.environ.get('ENABLE_OS_KEYRING') != '1':
         return ''
     try:
         import keyring
-        return keyring.get_password('PersonalDataAgent', SERVICE_KEYS[provider]) or ''
+        return keyring.get_password('PersonalDataAgent', 'groqcloud') or ''
     except Exception:
         return ''
 
 
-def save_key(provider, key):
-    import keyring
-    keyring.set_password('PersonalDataAgent', SERVICE_KEYS[provider], key)
-
-
-st.set_page_config(page_title='Personal AI Data Agent', page_icon='📊', layout='wide')
-st.title('📊 Personal AI Data Agent')
-st.caption('Ask questions about CSV, Excel, JSON, TXT, Markdown and text-based PDF files with Gemini, OpenAI, Grok (xAI) or GroqCloud.')
-
-if 'tables' not in st.session_state:
-    st.session_state.tables = {}
-if 'messages' not in st.session_state:
-    st.session_state.messages = []
-if 'temp_keys' not in st.session_state:
-    st.session_state.temp_keys = {}
-if 'dataset_signature' not in st.session_state:
+def close_workbook():
+    if st.session_state.get('workbook'):
+        st.session_state.workbook.close()
+    st.session_state.workbook = None
     st.session_state.dataset_signature = None
+    st.session_state.messages = []
 
-config = load_config()
-with st.sidebar:
-    st.header('⚙️ Settings')
-    providers = list(DEFAULT_MODELS)
-    provider = st.selectbox('AI provider', providers, index=providers.index(config.get('provider', 'GroqCloud')) if config.get('provider') in providers else 0)
-    model_name = st.text_input('Model name', value=config.get('models', {}).get(provider, DEFAULT_MODELS[provider]), key=f'model_{provider}', help='Enter a model ID available on your API account.')
-    input_budget = st.select_slider('Input context budget (tokens)', options=[6000, 12000, 24000], value=6000,
-                                   help='Conservative UTF-8 byte estimate including schema, question and prompt. Allow at least 1,200 more tokens for the response. Larger settings need a larger context model.')
-    if provider == 'GroqCloud':
-        st.caption('GroqCloud uses api.groq.com, not the xAI Grok endpoint. Create keys at console.groq.com.')
-    existing_key = load_key(provider)
-    api_input = st.text_input('API key', type='password', key=f'key_{provider}', placeholder='Saved securely' if existing_key else 'Paste API key here', help='Never paste your API key into the chat.')
-    store_key = False
-    if os.environ.get('ENABLE_OS_KEYRING') == '1':
-        store_key = st.checkbox('Save API key in operating-system credential store', value=False)
-    if st.button('Save settings', **WIDE):
-        config['provider'] = provider
-        config.setdefault('models', {})[provider] = model_name.strip()
-        save_config(config)
-        if api_input.strip():
-            st.session_state.temp_keys[provider] = api_input.strip()
-            if store_key:
-                try:
-                    save_key(provider, api_input.strip())
-                    st.success('Settings saved; API key stored in the OS credential manager.')
-                except Exception as exc:
-                    st.warning(f'Settings saved. Credential storage failed: {exc}. Key is only held in this session.')
+
+def new_chat():
+    st.session_state.messages = []
+
+
+def display(frame):
+    """Arrow-safe copy for display; date-only columns drop the 00:00:00 time."""
+    frame = frame.copy()
+    for column in frame.columns:
+        values = frame[column]
+        if pd.api.types.is_datetime64_any_dtype(values) and (values.dropna() == values.dropna().dt.normalize()).all():
+            frame[column] = values.dt.date
+    return sanitize_dataframe(frame)
+
+
+def ask(question):
+    st.session_state.pending_question = question
+
+
+def suggestions(workbook):
+    """Generic starter questions built from column types, never from field-name lists."""
+    sid, frame = next(iter(workbook.frames.items()))
+    kinds = {column: column_kind(frame[column]) for column in frame.columns[:40]}
+    # Measures vary but repeat; all-unique numbers are usually identifiers.
+    numbers = [c for c, k in kinds.items() if k == 'number' and 10 < frame[c].nunique() < len(frame)]
+    categories = [c for c, k in kinds.items() if k == 'text' and 1 < frame[c].nunique() <= 30]
+    dates = [c for c, k in kinds.items() if k == 'date']
+    questions = [f'Give me a quick overview of {workbook.labels[sid]}', 'Which columns have missing values?']
+    if numbers and categories:
+        questions.append(f'What is the total {numbers[0]} by {categories[0]}?')
+    if numbers and dates:
+        questions.append(f'How does {numbers[0]} change by month?')
+    elif numbers:
+        questions.append(f'Show the top 5 rows by {numbers[0]}')
+    return questions[:4]
+
+
+def render_steps(steps, key, expanded=False):
+    if not steps:
+        return
+    tables = [s for s in steps if s.frame is not None and not s.frame.empty]
+    label = f'📊 Data behind this answer · {len(tables)} table{"s" * (len(tables) != 1)}' if tables else '🔎 How this was answered'
+    with st.expander(label, expanded=expanded):
+        for index, step in enumerate(steps):
+            st.markdown(f'**{step.title}**  \n<span style="opacity:.7">{step.summary}</span>', unsafe_allow_html=True)
+            if step.sql:
+                st.code(step.sql, language='sql')
+            if step.frame is None or step.frame.empty:
+                continue
+            frame = step.frame
+            numbers = [c for c in frame.columns[1:] if pd.api.types.is_numeric_dtype(frame[c])]
+            if step.chart and numbers:
+                table_tab, chart_tab = st.tabs(['Table', 'Chart'])
+                chart_data = frame.set_index(frame.columns[0])[numbers[:3]]
+                chart_data.index = chart_data.index.astype(str)
+                with chart_tab:
+                    (st.line_chart if step.chart == 'line' else st.bar_chart)(chart_data)
             else:
-                st.success('Settings saved. Key is stored only for this session.')
-        else:
-            st.success('Settings saved.')
-    api_key = api_input.strip() or load_key(provider)
-    st.divider()
-    st.header('📁 Files')
-    uploads = st.file_uploader('Upload documents', type=['csv', 'xlsx', 'xls', 'json', 'txt', 'md', 'pdf'], accept_multiple_files=True)
-    st.caption('Your model receives column names, types, questions and bounded chat history. Queries and calculations run over the full data on the app server. Settings and entered keys stay in this browser session.')
-    st.caption('10,000+ rows do not need to fit in the model context. The model plans a query; calculations use every relevant row.')
-    st.caption('The model plans a query from your column names. The server validates and executes it over all rows. Analysis has a 60-second deadline.')
-    if st.button('Clear conversation', **WIDE):
-        st.session_state.messages = []
-        st.session_state.query_results = {}
-        st.rerun()
+                table_tab = st.container()
+            with table_tab:
+                st.dataframe(display(frame), hide_index=True, **WIDE)
+                st.download_button('⬇️ Download CSV', frame.to_csv(index=False).encode('utf-8-sig'),
+                                   f'result_{key}_{index + 1}.csv', mime='text/csv', key=f'download_{key}_{index}')
+
+
+st.set_page_config(page_title='Data QA Agent', page_icon='📊', layout='wide')
+st.markdown("""<style>
+[data-testid="stMainBlockContainer"], .block-container {max-width: 1100px; padding-top: 2.2rem;}
+[data-testid="stSidebar"] h3 {font-size: 1rem; margin-bottom: .2rem;}
+div[data-testid="stExpander"] details {border-radius: .6rem;}
+</style>""", unsafe_allow_html=True)
+
+for name, default in (('messages', []), ('workbook', None), ('dataset_signature', None), ('pending_question', None)):
+    st.session_state.setdefault(name, default)
+
+with st.sidebar:
+    st.markdown('### 🤖 Model · GroqCloud')
+    model_name = st.selectbox('Model', list(MODELS), key='model', accept_new_options=True,
+                              help='Pick a model, or type any model ID enabled on your GroqCloud account.') or DEFAULT_MODEL
+    st.caption(MODELS.get(model_name, 'Custom model: it must support tool calling'))
+    stored_key = load_key()
+    key_input = st.text_input('API key', type='password', key='api_key',
+                              placeholder='Using the configured key' if stored_key else 'Paste your GroqCloud key',
+                              help='Kept only in this browser session. Never paste it into the chat.')
+    api_key = key_input.strip() or stored_key
+    st.caption('🟢 Ready' if api_key else f'🔑 [Get a free GroqCloud key]({GROQ_KEY_URL})')
+    with st.expander('Advanced'):
+        input_budget = st.select_slider('Context budget (tokens per request)', [6000, 12000, 24000, 48000],
+                                        value=DEFAULT_INPUT_TOKENS, help='Lower it if you hit GroqCloud rate limits.')
+        if os.environ.get('ENABLE_OS_KEYRING') == '1' and key_input.strip() and st.button('Save key to this computer'):
+            try:
+                import keyring
+                keyring.set_password('PersonalDataAgent', 'groqcloud', key_input.strip())
+                st.success('Saved in the OS credential store.')
+            except Exception as exc:
+                st.warning(f'Could not save the key: {exc}')
+
+    st.markdown('### 📁 Data')
+    uploads = st.file_uploader('Excel or CSV files', type=SUPPORTED_TYPES, accept_multiple_files=True,
+                               help='Up to 20 MB per file and 60 MB in total. Each Excel sheet becomes its own table.')
 
 excel_options = {}
 if uploads:
     preview_cache = st.session_state.setdefault('excel_header_previews', {})
-    active_previews = {(f.name, f.size, f.file_id) for f in uploads if f.name.lower().endswith(('.xlsx', '.xls'))}
-    for cached in list(preview_cache):
-        if cached not in active_previews:
-            del preview_cache[cached]
+    active = {(f.name, f.size, f.file_id) for f in uploads if f.name.lower().endswith(('.xlsx', '.xlsm', '.xls'))}
+    for cached in [c for c in preview_cache if c not in active]:
+        del preview_cache[cached]
     for upload in uploads:
-        if not upload.name.lower().endswith(('.xlsx', '.xls')):
+        if not upload.name.lower().endswith(('.xlsx', '.xlsm', '.xls')):
             continue
         cache_key = (upload.name, upload.size, upload.file_id)
         try:
             if cache_key not in preview_cache:
                 preview_cache[cache_key] = excel_previews(upload)
             with st.sidebar.expander(f'Excel header settings: {upload.name}'):
-                st.caption('Preview shows original Excel row numbers. Change the header row if the sheet starts with titles or merged cells.')
+                st.caption('Change the header row if the sheet starts with titles or merged cells. Row numbers match Excel.')
                 for sheet, preview in preview_cache[cache_key].items():
                     st.markdown(f'**{sheet}**')
                     key = f'excel_{upload.file_id}_{sheet}'
@@ -154,120 +187,116 @@ if uploads:
                     st.dataframe(sanitize_dataframe(visible), **WIDE)
         except Exception as exc:
             st.sidebar.warning(f'Excel header preview unavailable for {upload.name}: {exc}')
-    sig = (tuple((f.name, f.size, f.file_id) for f in uploads), json.dumps(excel_options, sort_keys=True))
-    if sig != st.session_state.dataset_signature:
+    signature = (tuple((f.name, f.size, f.file_id) for f in uploads), json.dumps(excel_options, sort_keys=True))
+    if signature != st.session_state.dataset_signature:
         try:
             if sum(f.size for f in uploads) > MAX_TOTAL_BYTES:
                 raise ValueError('Combined uploads must be 60 MB or smaller.')
-            all_tables = {}
-            for upload in uploads:
-                for name, frame in read_upload(upload, excel_headers=excel_options.get(upload.file_id)).items():
-                    if name in all_tables:
-                        raise ValueError(f'Duplicate table name: {name}; rename one file.')
-                    all_tables[name] = frame
-                    if sum(int(df.memory_usage(deep=True).sum()) for df in all_tables.values()) > 200 * 1024 * 1024:
-                        raise ValueError('Loaded datasets exceed the 200 MB session memory limit; upload fewer files.')
-            st.session_state.tables = all_tables
-            if st.session_state.get('search_index'):
-                st.session_state.search_index.close()
-            st.session_state.search_index = DocumentSearch(all_tables)
-            if st.session_state.get('table_store'):
-                st.session_state.table_store.close()
-            st.session_state.table_store = TableStore(all_tables)
-            st.session_state.dataset_signature = sig
-            st.session_state.messages = []
-            st.session_state.query_results = {}
-        except Exception as e:
-            if st.session_state.get('search_index'):
-                st.session_state.search_index.close()
-            st.session_state.search_index = None
-            if st.session_state.get('table_store'):
-                st.session_state.table_store.close()
-            st.session_state.table_store = None
-            st.session_state.tables = {}
-            st.session_state.dataset_signature = None
-            st.session_state.messages = []
-            st.session_state.query_results = {}
-            st.error(f'File loading failed: {e}')
-else:
+            tables = {}
+            with st.spinner('Reading your files…'):
+                for upload in uploads:
+                    for name, frame in read_upload(upload, excel_headers=excel_options.get(upload.file_id)).items():
+                        if name in tables:
+                            raise ValueError(f'Duplicate table name: {name}; rename one file.')
+                        tables[name] = frame
+                        if sum(int(df.memory_usage(deep=True).sum()) for df in tables.values()) > 200 * 1024 * 1024:
+                            raise ValueError('The files use more than 200 MB of memory; upload fewer files.')
+            close_workbook()
+            st.session_state.workbook = Workbook(tables)
+            st.session_state.dataset_signature = signature
+        except Exception as exc:
+            close_workbook()
+            st.error(f'Could not load the files: {exc}')
+elif st.session_state.workbook:
+    close_workbook()
     st.session_state.excel_header_previews = {}
-    if st.session_state.get('search_index'):
-        st.session_state.search_index.close()
-    st.session_state.search_index = None
-    if st.session_state.get('table_store'):
-        st.session_state.table_store.close()
-    st.session_state.table_store = None
-    st.session_state.tables = {}
-    st.session_state.dataset_signature = None
-    st.session_state.query_results = {}
 
-if st.session_state.tables:
-    with st.sidebar:
-        scope_options = [None] + list(st.session_state.tables)
-        dataset_scope = st.selectbox('Query dataset', scope_options,
-                                    format_func=lambda value: 'All uploaded datasets' if value is None else value,
-                                    help='Narrow the schema sent to the model when you have many tables or columns.')
-    st.subheader('Loaded datasets')
-    for name, df in st.session_state.tables.items():
-        with st.expander(f'{name} — {len(df):,} rows × {len(df.columns)} columns'):
-            if 'header_row' in df.attrs:
-                header = df.attrs['header_row']
-                st.caption(f"Headers: Excel row {header}, {df.attrs['header_rows']} row(s), {df.attrs['header_mode']}."
-                           if header is not None else 'No header detected/selected; all data rows are retained with positional column names.')
-                if df.attrs.get('generic_headers'):
-                    st.caption('Blank header cells use positional names: ' + ', '.join(df.attrs['generic_headers'])
-                               + '. Adjust Excel header settings in the sidebar if the real labels are on another row.')
-            st.dataframe(sanitize_dataframe(df.head(100)), **WIDE)
+workbook = st.session_state.workbook
+scope = None
+with st.sidebar:
+    if workbook and len(workbook.frames) > 1:
+        choice = st.selectbox('Ask about', [None] + list(workbook.frames),
+                              format_func=lambda sid: 'All sheets' if sid is None else workbook.labels[sid],
+                              help='Focusing on one sheet keeps requests small and answers faster.')
+        scope = [choice] if choice else None
+    if st.session_state.messages:
+        st.divider()
+        left, right = st.columns(2)
+        left.button('🧹 New chat', on_click=new_chat, **WIDE)
+        right.download_button('⬇️ Export', json.dumps([{'role': m['role'], 'content': m['content']}
+                                                       for m in st.session_state.messages], ensure_ascii=False, indent=2),
+                              'data_qa_chat.json', mime='application/json', **WIDE)
+
+st.title('📊 Data QA Agent')
+st.caption('Ask questions about your Excel and CSV files in plain language. The agent runs queries over every row '
+           'on this machine and sends only small, relevant results to the AI model.')
+
+if not workbook:
+    columns = st.columns(3)
+    for column, (title, text) in zip(columns, [
+            ('1 · Add your key', 'Paste a GroqCloud API key in the sidebar.'),
+            ('2 · Upload data', 'Drop Excel or CSV files in the sidebar. Large sheets are fine.'),
+            ('3 · Ask', 'Totals, filters, rankings, trends, missing values, comparisons…')]):
+        with column.container(border=True):
+            st.markdown(f'**{title}**')
+            st.caption(text)
 else:
-    st.info('Upload a file using the left sidebar to start.')
+    total_rows = sum(len(frame) for frame in workbook.frames.values())
+    with st.expander(f'📄 {len(workbook.frames)} sheet{"s" * (len(workbook.frames) != 1)} loaded · {total_rows:,} rows',
+                     expanded=not st.session_state.messages):
+        ids = list(workbook.frames)
+        tabs = st.tabs([workbook.labels[sid] for sid in ids[:10]]) if len(ids) > 1 else [st.container()]
+        for sid, tab in zip(ids, tabs):
+            frame = workbook.frames[sid]
+            with tab:
+                st.caption(f'{len(frame):,} rows × {len(frame.columns)} columns · showing the first 100 rows')
+                if 'header_row' in frame.attrs:
+                    header = frame.attrs['header_row']
+                    if frame.attrs.get('generic_headers'):
+                        st.caption('Unlabelled columns: ' + ', '.join(frame.attrs['generic_headers'])
+                                   + '. If the real labels are on another row, change it in Excel header settings.')
+                    elif header and header > 1:
+                        st.caption(f'Headers read from Excel row {header}.')
+                st.dataframe(display(frame.head(100)), hide_index=True, height=260, **WIDE)
+        if len(ids) > 10:
+            st.caption(f'{len(ids) - 10} more sheets are loaded and can be queried.')
 
-for msg in st.session_state.messages:
-    with st.chat_message(msg['role']):
-        st.markdown(msg['content'])
+for index, message in enumerate(st.session_state.messages):
+    with st.chat_message(message['role']):
+        st.markdown(message['content'])
+        render_steps(message.get('steps'), f'm{index}')
 
-question = st.chat_input('Example: Which product has the highest total sales?')
-if question:
-    if not st.session_state.tables:
-        st.warning('Please upload at least one file first.')
-    else:
-        pending = st.session_state.messages + [{'role': 'user', 'content': question}]
-        with st.chat_message('user'):
-            st.markdown(question)
-        with st.chat_message('assistant'):
-            started = time.monotonic()
-            status = st.status(f'Analyzing — maximum {ANALYSIS_TIMEOUT} seconds', expanded=True)
-            try:
-                st.session_state.query_results = {}
-                chat = bounded_chat(pending)
-                if not api_key:
-                    raise ValueError('Enter your API key in Settings.')
-                if not model_name.strip():
-                    raise ValueError('Enter a model name in Settings.')
-                model = build_model(provider, model_name.strip(), api_key)
-                def progress(message):
-                    status.write(f'{time.monotonic() - started:.0f}s · {message}')
-                result = asyncio.run(run_query(model, st.session_state.tables, chat, progress,
-                                              input_budget=input_budget,
-                                              search_index=st.session_state.get('search_index'),
-                                              store=st.session_state.get('table_store'),
-                                              table_names=[dataset_scope] if dataset_scope is not None else None))
-                answer = result.answer
-                st.session_state.query_results = result.results
-                status.update(label=f'Completed in {time.monotonic() - started:.1f}s', state='complete', expanded=False)
-                st.markdown(answer)
-                st.session_state.messages = pending
-                st.session_state.messages.append({'role': 'assistant', 'content': answer})
-            except Exception as exc:
-                status.update(label='Analysis stopped', state='error', expanded=False)
-                st.error(friendly_error(exc))
-                st.caption('Your files are still loaded. You can submit the question again; failed turns are not added to model history.')
+if workbook and not st.session_state.messages and not st.session_state.pending_question:
+    st.markdown('**Try asking**')
+    options = suggestions(workbook)
+    columns = st.columns(2)
+    for index, question in enumerate(options):
+        columns[index % 2].button(question, on_click=ask, args=(question,), key=f'suggestion_{index}', **WIDE)
 
-for index, (source, result) in enumerate(st.session_state.get('query_results', {}).items()):
-    st.caption(f'{source} — {len(result):,} result rows')
-    st.dataframe(sanitize_dataframe(result), **WIDE)
-    st.download_button('Download query results (CSV)', result.to_csv(index=False),
-                       f'query_results_{index + 1}.csv', mime='text/csv', key=f'query_result_{index}')
-
-if st.session_state.messages:
-    st.download_button('⬇️ Export conversation', json.dumps(st.session_state.messages, ensure_ascii=False, indent=2),
-                       'data_agent_chat.json', mime='application/json')
+typed = st.chat_input('Ask a question about your data…' if workbook else 'Upload a file to start', disabled=not workbook)
+question = typed or st.session_state.pending_question
+st.session_state.pending_question = None
+if question and workbook:
+    history = [{'role': m['role'], 'content': m['content']} for m in st.session_state.messages]
+    with st.chat_message('user'):
+        st.markdown(question)
+    with st.chat_message('assistant'):
+        started = time.monotonic()
+        status = st.status('Thinking…', expanded=True)
+        try:
+            if not api_key:
+                raise ValueError('Enter your GroqCloud API key in the sidebar.')
+            chat = bounded_chat(history + [{'role': 'user', 'content': question}])
+            model = build_model(model_name.strip(), api_key)
+            answer = asyncio.run(answer_question(model, workbook, chat, status.write, input_budget, sheets=scope))
+            queries = sum(step.frame is not None for step in answer.steps)
+            status.update(label=f'Answered in {time.monotonic() - started:.1f}s · {queries} '
+                                f'quer{"y" if queries == 1 else "ies"} over your data',
+                          state='complete', expanded=False)
+            st.markdown(answer.text)
+            render_steps(answer.steps, f'm{len(st.session_state.messages) + 1}')
+            st.session_state.messages += [{'role': 'user', 'content': question},
+                                          {'role': 'assistant', 'content': answer.text, 'steps': answer.steps}]
+        except Exception as exc:
+            status.update(label='Stopped', state='error', expanded=False)
+            st.error(friendly_error(exc))

@@ -20,13 +20,14 @@ def column_names(values):
     base = [label(value) for value in values]
     base = [f'Column {get_column_letter(i + 1)}' if not name or re.fullmatch(r'Unnamed: \d+(?:_level_\d+)?', name)
             else name for i, name in enumerate(base)]
-    reserved, seen, result = set(base), set(), []
+    # Case-insensitive, because SQL column names are case-insensitive.
+    reserved, seen, result = {name.casefold() for name in base}, set(), []
     for name in base:
         candidate, suffix = name, 2
-        while candidate in seen or (candidate != name and candidate in reserved):
+        while candidate.casefold() in seen or (candidate != name and candidate.casefold() in reserved):
             candidate = f'{name} ({suffix})'
             suffix += 1
-        seen.add(candidate)
+        seen.add(candidate.casefold())
         result.append(candidate)
     return result
 
