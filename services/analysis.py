@@ -16,7 +16,7 @@ async def analyze(agent, chat, progress=None, timeout=ANALYSIS_TIMEOUT):
     calls = 0
     async with asyncio.timeout(timeout):
         async for update in agent.astream({'messages': chat},
-                                         config={'recursion_limit': 16}, stream_mode='updates'):
+                                         config={'recursion_limit': MAX_MODEL_CALLS * 4 + 4}, stream_mode='updates'):
             for node, value in update.items():
                 if not isinstance(value, dict):
                     continue
@@ -61,7 +61,7 @@ def friendly_error(exc):
     if 'connection' in kind.lower() or status and status >= 500:
         return 'The AI service could not be reached or is temporarily unavailable. Try again shortly.'
     if kind in ('GraphRecursionError', 'ModelCallLimitExceededError'):
-        return 'The model used too many analysis steps. Ask one specific question at a time or choose a stronger tool-calling model.'
+        return 'The analysis step limit was reached before a final answer was produced. Your files are still loaded; retry the question or clear the conversation.'
     if status == 400 or 'tool' in detail and any(word in detail for word in ('failed', 'invalid', 'support')):
         return 'The model could not complete a valid request or tool call. Try a simpler question or another model that supports tool calling.'
     if isinstance(exc, ValueError) and str(exc).startswith(('Please shorten', 'The model')):

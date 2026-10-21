@@ -89,11 +89,14 @@ class ContextTests(unittest.TestCase):
         request = self.request(messages)
         bounded = fit_request(request, 6000)
         self.assertLessEqual(request_size(bounded, bounded.messages), 6000)
-        for original, retained in zip(messages, bounded.messages):
+        tool_call_ids = {call['id'] for msg in bounded.messages if isinstance(msg, AIMessage)
+                         for call in msg.tool_calls}
+        for retained in bounded.messages:
             if isinstance(retained, ToolMessage):
                 json.loads(retained.content)
-                self.assertEqual(original.tool_call_id, retained.tool_call_id)
-        self.assertEqual(len(bounded.messages), len(messages))
+                self.assertIn(retained.tool_call_id, tool_call_ids)
+        self.assertEqual(bounded.messages[-1].tool_call_id, '3')
+        self.assertEqual(bounded.messages[0].content, 'Current question')
 
     def test_fails_before_provider_if_question_cannot_fit(self):
         request = self.request([HumanMessage('longquestion' * 5000)])

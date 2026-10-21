@@ -13,6 +13,14 @@ MAX_ROWS = 200_000
 MAX_TEXT_CHARS = 1_000_000
 MAX_TOOL_CHARS = 3_000
 MAX_TOTAL_BYTES = 60 * 1024 * 1024
+MISSING_MARKERS = frozenset({'', '-', '--', 'na', 'n/a', 'nan', 'none', 'null',
+                             'not provided', 'not submitted', 'not available'})
+
+
+def missing_mask(series: pd.Series) -> pd.Series:
+    """Blank/null cells and explicit absence markers; zero is not assumed missing."""
+    normalized = series.astype('string').str.strip().str.casefold()
+    return series.isna() | normalized.isin(MISSING_MARKERS)
 
 
 def compact(value: Any, max_chars=MAX_TOOL_CHARS) -> str:
@@ -158,7 +166,7 @@ def make_tools(tables: dict[str, pd.DataFrame], search_index=None):
 
     @tool
     def describe_table(table: str, column: str = '', start: int = 0) -> str:
-        """Inspect types, missing counts, stats and 2 samples for up to 12 columns. Use column for one column or start for schema pagination."""
+        """List column names, types and missing counts (12/page). column adds stats and 2 samples for one column. start pages schema."""
         try:
             df = get_table(table)
             total_columns = len(df.columns)
@@ -168,11 +176,13 @@ def make_tools(tables: dict[str, pd.DataFrame], search_index=None):
                       'total_columns': total_columns, 'start': start,
                       'next_start': start + 12 if not column and start + 12 < total_columns else None,
                       'columns': [{'name': str(c), 'dtype': str(df[c].dtype),
-                                   'nulls': int(df[c].isna().sum())} for c in df.columns],
-                      'sample': df.head(2).to_dict('records')}
-            numeric = df.select_dtypes(include='number')
-            if len(numeric.columns):
-                result['numeric_statistics'] = numeric.describe().round(3).to_dict()
+                                   'nulls': int(df[c].isna().sum()),
+                                   'missing': int(missing_mask(df[c]).sum())} for c in df.columns]}
+            if column:
+                result['sample'] = df.head(2).to_dict('records')
+                numeric = df.select_dtypes(include='number')
+                if len(numeric.columns):
+                    result['numeric_statistics'] = numeric.describe().round(3).to_dict()
             return compact(result)
         except Exception as e:
             return f'Error: {e}'
@@ -226,13 +236,20 @@ def make_tools(tables: dict[str, pd.DataFrame], search_index=None):
             return f'Error: {e}'
 
     @tool
-    def filter_rows(table: str, column: str, operator: str, value: str, limit: int = 15) -> str:
-        """Filter records using ==, !=, >, >=, <, <=, contains. Value is a string; numeric comparisons convert the column to numbers."""
+    def filter_rows(table: str, column: str, operator: str, value: str = '', limit: int = 15,
+                    columns: list[str] | None = None) -> str:
+        """Query all rows: is_missing/is_not_missing (no value needed), ==, !=, >, >=, <, <=, contains. columns selects returned identifiers, e.g. student name/roll. Returns exact match count and up to 20 matching rows."""
         try:
             df = get_table(table)
             if column not in df:
                 return f'Unknown column: {column}. Available: {list(df.columns)}'
-            if operator == 'contains':
+            if columns is not None and any(c not in df for c in columns):
+                return compact({'error': 'Unknown return column. Use exact names from describe_table.'})
+            if operator in ('is_missing', 'is_not_missing'):
+                mask = missing_mask(df[column])
+                if operator == 'is_not_missing':
+                    mask = ~mask
+            elif operator == 'contains':
                 mask = df[column].astype('string').str.contains(re.escape(value), case=False, na=False, regex=True)
             elif operator in ('>', '>=', '<', '<='):
                 nums = pd.to_numeric(df[column], errors='coerce')
@@ -243,9 +260,14 @@ def make_tools(tables: dict[str, pd.DataFrame], search_index=None):
                 if operator == '!=':
                     mask = ~mask
             else:
-                return 'Invalid operator'
+                return compact({'error': 'Use is_missing, is_not_missing, ==, !=, >, >=, <, <= or contains.'})
             found = df.loc[mask]
-            return compact({'matches': len(found), 'rows': found.head(max(1, min(limit, 20))).fillna('').to_dict('records')})
+            selected = found[columns] if columns is not None else found
+            result = {'table': table, 'column': column, 'rows_scanned': len(df), 'matches': len(found),
+                      'rows': selected.head(max(1, min(limit, 20))).to_dict('records')}
+            if operator in ('is_missing', 'is_not_missing'):
+                result['missing_definition'] = 'Null, blank/whitespace, -, --, NA, N/A, NaN, None, null, not provided/submitted/available. Zero is not treated as missing.'
+            return compact(result)
         except Exception as e:
             return f'Error: {e}'
 
