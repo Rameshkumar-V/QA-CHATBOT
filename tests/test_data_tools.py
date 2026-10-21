@@ -82,7 +82,8 @@ class LargeExcelTests(unittest.TestCase):
         self.assertEqual(first.session_state['settings']['provider'], 'OpenAI')
         second = AppTest.from_file(str(Path(__file__).resolve().parents[1] / 'app.py')).run(timeout=30)
         self.assertEqual(len(second.exception), 0)
-        self.assertEqual(second.selectbox[0].value, 'Gemini')
+        self.assertEqual(second.selectbox[0].value, 'GroqCloud')
+        self.assertEqual(second.text_input[0].value, 'openai/gpt-oss-20b')
 
 
 if __name__ == '__main__':

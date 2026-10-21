@@ -6,15 +6,16 @@ from typing import Any
 
 import pandas as pd
 from langchain_core.tools import tool
+from services.search import DocumentSearch
 
 MAX_BYTES = 20 * 1024 * 1024
 MAX_ROWS = 200_000
-MAX_TEXT_CHARS = 60_000
-MAX_TOOL_CHARS = 6_000
+MAX_TEXT_CHARS = 1_000_000
+MAX_TOOL_CHARS = 3_000
 MAX_TOTAL_BYTES = 60 * 1024 * 1024
 
 
-def compact(value: Any) -> str:
+def compact(value: Any, max_chars=MAX_TOOL_CHARS) -> str:
     """Return valid JSON, explicitly marking budget omissions instead of slicing JSON."""
     def clean(item):
         if isinstance(item, dict):
@@ -31,13 +32,13 @@ def compact(value: Any) -> str:
     def encode():
         return json.dumps(payload, ensure_ascii=False, default=str, allow_nan=False)
     result = encode()
-    if len(result) <= MAX_TOOL_CHARS:
+    if len(result) <= max_chars:
         return result
     if not isinstance(payload, dict):
         payload = {'items': payload}
     payload['truncated'] = True
     # Shrink the largest container, retaining metadata and whole JSON records.
-    while len(encode()) > MAX_TOOL_CHARS:
+    while len(encode()) > max_chars:
         candidates = [(len(json.dumps(v, default=str)), k) for k, v in payload.items()
                       if isinstance(v, (list, dict)) and v]
         if not candidates:
@@ -53,7 +54,7 @@ def compact(value: Any) -> str:
 def sanitize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure DataFrame column names are strings and mixed-type columns are Arrow-compatible."""
     df.columns = [str(c) for c in df.columns]
-    for col in df.select_dtypes(include=['object']).columns:
+    for col in (c for c in df.columns if df[c].dtype == 'object'):
         if df[col].map(lambda x: isinstance(x, bytes)).any():
             df[col] = df[col].map(lambda x: x.decode('utf-8', errors='replace') if isinstance(x, bytes) else x)
     try:
@@ -103,8 +104,10 @@ def read_upload(file) -> dict[str, pd.DataFrame]:
         else:
             tables[filename] = pd.DataFrame({'value': [data]})
     elif suffix in ('txt', 'md'):
-        text = raw.decode('utf-8-sig', errors='replace')[:MAX_TEXT_CHARS]
-        tables[filename] = pd.DataFrame({'text': text.splitlines()[:MAX_ROWS]})
+        text = raw.decode('utf-8-sig', errors='replace')
+        if len(text) > MAX_TEXT_CHARS:
+            raise ValueError('Text exceeds 1,000,000 characters; split the document into smaller files.')
+        tables[filename] = pd.DataFrame({'text': text.splitlines()})
     elif suffix == 'pdf':
         from pypdf import PdfReader
         reader = PdfReader(io.BytesIO(raw))
@@ -112,13 +115,17 @@ def read_upload(file) -> dict[str, pd.DataFrame]:
             raise ValueError('Password-protected PDFs are not supported')
         lines = []
         used = 0
-        for i, page in enumerate(reader.pages[:100], 1):
-            chunk = (page.extract_text() or '')[:MAX_TEXT_CHARS - used]
+        if len(reader.pages) > 100:
+            raise ValueError('PDF exceeds 100 pages; split it into smaller files.')
+        for i, page in enumerate(reader.pages, 1):
+            chunk = page.extract_text() or ''
             if chunk:
                 lines.append({'page': i, 'text': chunk})
                 used += len(chunk)
-            if used >= MAX_TEXT_CHARS:
-                break
+            if used > MAX_TEXT_CHARS:
+                raise ValueError('PDF text exceeds 1,000,000 characters; split it into smaller files.')
+        if not lines:
+            raise ValueError('No readable text found in PDF. Use a text-based PDF or run OCR first.')
         tables[filename] = pd.DataFrame(lines, columns=['page', 'text'])
     else:
         raise ValueError('Unsupported format')
@@ -129,11 +136,20 @@ def read_upload(file) -> dict[str, pd.DataFrame]:
     return tables
 
 
-def make_tools(tables: dict[str, pd.DataFrame]):
+def make_tools(tables: dict[str, pd.DataFrame], search_index=None):
+    search_index = search_index or DocumentSearch(tables)
     def get_table(table: str) -> pd.DataFrame:
         if table not in tables:
             raise ValueError(f'Unknown table {table!r}. Call list_tables first.')
         return tables[table]
+
+    @tool
+    def search_documents(table: str, query: str, offset: int = 0) -> str:
+        """Search all rows via a full-text index. Use a few keywords. Returns 3 ranked passages with row/column/page sources; offset pages through matches."""
+        try:
+            return compact(search_index.search(table, query, offset=offset))
+        except Exception as exc:
+            return compact({'error': str(exc)})
 
     @tool
     def list_tables() -> str:
@@ -233,4 +249,4 @@ def make_tools(tables: dict[str, pd.DataFrame]):
         except Exception as e:
             return f'Error: {e}'
 
-    return [list_tables, describe_table, preview_rows, value_counts, aggregate, filter_rows]
+    return [list_tables, describe_table, preview_rows, value_counts, aggregate, filter_rows, search_documents]

@@ -2,6 +2,8 @@
 
 Local Streamlit UI + LangChain read-only data agent using user-provided Gemini, OpenAI, xAI (Grok) or GroqCloud API keys.
 
+Default: **GroqCloud** with **`openai/gpt-oss-20b`**, using a Groq API key. Other providers and models remain selectable. Groq model and tool support: https://console.groq.com/docs/tool-use/overview
+
 ## Deploy on Streamlit Community Cloud
 
 1. Push this folder to your GitHub repository. Do not commit `.venv`, API keys, or uploaded datasets.
@@ -16,11 +18,25 @@ Deployment reference: https://docs.streamlit.io/deploy/streamlit-community-cloud
 
 10,000 rows are processed by pandas on the app server. The model receives table metadata, bounded samples, and calculated results; the whole workbook is never inserted into a prompt. Totals, counts, filters, and grouped calculations scan the full table. Preview rows are only for inspection. Grouped results return the top 20 groups with the total group count, so a partial listing is explicit.
 
-Each tool response is limited to 6,000 characters of valid JSON. Oversized results are marked as truncated; long cell text is marked when shortened. Schema inspection supports 12-column pages or a single requested column. Recent conversation context is limited to 6,000 characters plus the current question (maximum 4,000 characters). These are character budgets, not tokenizer guarantees: a model still needs enough context for tool definitions and multiple tool calls, plus reliable tool-calling support. Arbitrarily tiny models and complex joins are not guaranteed.
+Each tool response is limited to 3,000 characters of valid JSON. Oversized results are marked as truncated; long cell text is marked when shortened. Schema inspection supports 12-column pages or a single requested column. Recent conversation context is limited to 6,000 characters plus the current question (maximum 4,000 characters).
+
+Before **every** model call, middleware checks the combined system prompt, tool schemas, question, history, tool calls and results. The default input budget is 6,000 conservative token units, estimated using serialized UTF-8 bytes plus an overhead reserve, rather than assuming English characters equal tokens. Old conversation turns and tool bodies are retired first; oversized results are reduced as valid JSON with omission metadata. If input still exceeds the budget, the request is stopped locally with an actionable error. Allow at least 1,200 additional output tokens; select a higher input budget only for larger-context models. Arbitrarily tiny context windows are not supported.
+
+## Query documents instead of sending all rows
+
+`search_documents` uses a session-local SQLite FTS5 index, built once on its first query and reused for later questions. Text cells are indexed in overlapping 800-character passages. The agent supplies a few keywords; the index ranks matches and returns up to 3 excerpts with table, row, column, chunk and PDF page references. This works for documents with 1,000+ rows and for answers deep inside a long cell. Source rows are one-based DataFrame positions, excluding an Excel/CSV header.
+
+Only the index builder reads the content once. Subsequent queries use the index; the model never receives the full document. Search uses literal keyword tokens with OR matching and BM25 ranking, not semantic embeddings or whole-document summarization. A lack of matches is not proof that the topic is absent; try other terms. Tools expose constrained queries, not arbitrary SQL or Python execution. SQLite must include FTS5 (standard Community Cloud Python supports this).
+
+## Analysis progress and errors
+
+Analysis shows model/tool progress and elapsed time. Each provider request has a 20-second timeout and no automatic retries. The async agent has a 60-second overall deadline and a maximum of 5 model calls, with output limited to 1,200 tokens per call. Slow network calls are cancelled at the deadline; a synchronous server-side tool already running may finish its current work during cancellation. File parsing occurs before the analysis deadline.
+
+Invalid credentials, unavailable models, rate limits/quota, context overflow, connection problems, step limits, empty answers and timeouts show recovery guidance without exposing raw provider responses. Failed questions do not enter subsequent model history, and loaded files remain available to retry.
 
 Limits: 20 MB per file, 60 MB combined uploads, 200,000 rows per table, 30 sheets per workbook, and 200 MB estimated DataFrame memory per session. Cloud resources are shared across users; large compressed workbooks can use substantial memory during parsing before the memory check. Uploaded tables, settings and entered keys are held per session. Refreshing or reconnecting may reset them. Analysis occurs on the Cloud server when deployed, and bounded tool results are sent to the selected provider.
 
-Run the regression checks with `python -m unittest discover -s tests -v`. They generate a 10,000-row workbook in memory and verify full-data totals, grouping, filtering, output limits and session isolation without API calls.
+Run the regression checks with `python -m unittest discover -s tests -v`. They verify 10,000-row Excel calculations, indexed retrieval across 1,000 document rows, complete agent query flow, context budgets, deadlines, safe errors and session isolation without provider API calls.
 
 ## Run locally (Windows)
 
@@ -44,9 +60,9 @@ PyInstaller + Streamlit bundling can need adjustments for specific versions/envi
 
 - CSV, XLSX, XLS, JSON, TXT, MD and text-based PDF (not scanned/OCR).
 - Excel workbook sheets are loaded as separate named datasets.
-- Agent tools: list tables, inspect columns and stats, preview rows, value counts, aggregate metrics, filter rows.
+- Agent tools: indexed document search, list tables, inspect columns and stats, preview rows, value counts, aggregate metrics, filter rows.
 - Uploads are read locally into pandas, and relevant tool outputs are sent to the selected cloud LLM. No arbitrary Python execution and no modification of source files.
-- Max 20 MB/file; 200,000 rows/table; up to 30 Excel sheets; PDF text max 100 pages or 60,000 characters. Avoid opening files that contain highly sensitive information unless your chosen AI provider's data policy is acceptable.
+- Max 20 MB/file; 200,000 rows/table; up to 30 Excel sheets; text files/PDF text max 1,000,000 characters; PDF max 100 pages. Oversized text/PDF files are rejected with split-file guidance rather than silently dropping the end. Avoid opening files that contain highly sensitive information unless your chosen AI provider's data policy is acceptable.
 - API keys and provider/model settings stay in the browser session by default. For a trusted local desktop only, install `requirements-desktop.txt` and set `ENABLE_OS_KEYRING=1` to enable optional OS credential storage. Keep this option disabled on shared servers.
 - Agent tools return bounded data samples; for complex joins, plotting, pivots and larger-scale analysis, add explicit constrained tools.
 - Works online only: API calls to Gemini, xAI, GroqCloud or OpenAI require internet access, API key, and available quota/billing. Provider model IDs can be changed in Settings.
@@ -74,4 +90,4 @@ Build from Windows 10 x64 using Python 3.11 to target Windows 10 and Windows 11 
 
 ## GroqCloud vs xAI Grok
 
-GroqCloud and xAI Grok are separate services with incompatible API keys. Select **GroqCloud** for keys from https://console.groq.com/keys (endpoint `https://api.groq.com/openai/v1`); select **Grok (xAI)** for keys from https://console.x.ai (endpoint `https://api.x.ai/v1`). Set the model to one supported by your provider. GroqCloud starter example: `llama-3.3-70b-versatile`.
+GroqCloud and xAI Grok are separate services with incompatible API keys. Select **GroqCloud** for keys from https://console.groq.com/keys (endpoint `https://api.groq.com/openai/v1`); select **Grok (xAI)** for keys from https://console.x.ai (endpoint `https://api.x.ai/v1`). Set the model to one supported by your provider. GroqCloud default: `openai/gpt-oss-20b`.
