@@ -9,11 +9,12 @@ import time
 import streamlit as st
 
 from services.data_tools import read_upload, sanitize_dataframe, MAX_TOTAL_BYTES
-from agent.factory import create_data_agent, build_model
+from agent.factory import build_model
 from services.context import bounded_chat
-from services.analysis import analyze, friendly_error, ANALYSIS_TIMEOUT
+from services.analysis import friendly_error, ANALYSIS_TIMEOUT
 from services.search import DocumentSearch
-from services.direct_queries import answer_missing_aadhaar
+from services.query_planner import run_query
+from services.table_store import TableStore
 
 def _width_kwarg(stretch: bool = True) -> dict:
     if 'width' in inspect.signature(st.button).parameters:
@@ -80,7 +81,7 @@ with st.sidebar:
     provider = st.selectbox('AI provider', providers, index=providers.index(config.get('provider', 'GroqCloud')) if config.get('provider') in providers else 0)
     model_name = st.text_input('Model name', value=config.get('models', {}).get(provider, DEFAULT_MODELS[provider]), key=f'model_{provider}', help='Enter a model ID available on your API account.')
     input_budget = st.select_slider('Input context budget (tokens)', options=[6000, 12000, 24000], value=6000,
-                                   help='Conservative UTF-8 byte estimate of input tokens, including tools and system prompt. Allow at least 1,200 more tokens for the response. Larger settings need a larger context model.')
+                                   help='Conservative UTF-8 byte estimate including schema, question and prompt. Allow at least 1,200 more tokens for the response. Larger settings need a larger context model.')
     if provider == 'GroqCloud':
         st.caption('GroqCloud uses api.groq.com, not the xAI Grok endpoint. Create keys at console.groq.com.')
     existing_key = load_key(provider)
@@ -108,13 +109,12 @@ with st.sidebar:
     st.divider()
     st.header('📁 Files')
     uploads = st.file_uploader('Upload documents', type=['csv', 'xlsx', 'xls', 'json', 'txt', 'md', 'pdf'], accept_multiple_files=True)
-    st.caption('Full datasets are analyzed on the app server. Only bounded tool results are sent to your AI provider. Settings and entered keys stay in this browser session.')
-    st.caption('10,000+ rows work with small models that support tool calling. Calculations use every row, not just the preview.')
-    st.caption('Documents use indexed keyword queries with source excerpts. Analysis stops after 60 seconds or 5 model calls.')
-    st.caption('Missing Aadhaar queries run directly on the server without model calls, including Adaar/Adhaar spellings.')
+    st.caption('Your model receives column names, types, questions and bounded chat history. Queries and calculations run over the full data on the app server. Settings and entered keys stay in this browser session.')
+    st.caption('10,000+ rows do not need to fit in the model context. The model plans a query; calculations use every relevant row.')
+    st.caption('The model plans a query from your column names. The server validates and executes it over all rows. Analysis has a 60-second deadline.')
     if st.button('Clear conversation', **WIDE):
         st.session_state.messages = []
-        st.session_state.direct_results = {}
+        st.session_state.query_results = {}
         st.rerun()
 
 if uploads:
@@ -135,27 +135,41 @@ if uploads:
             if st.session_state.get('search_index'):
                 st.session_state.search_index.close()
             st.session_state.search_index = DocumentSearch(all_tables)
+            if st.session_state.get('table_store'):
+                st.session_state.table_store.close()
+            st.session_state.table_store = TableStore(all_tables)
             st.session_state.dataset_signature = sig
             st.session_state.messages = []
-            st.session_state.direct_results = {}
+            st.session_state.query_results = {}
         except Exception as e:
             if st.session_state.get('search_index'):
                 st.session_state.search_index.close()
             st.session_state.search_index = None
+            if st.session_state.get('table_store'):
+                st.session_state.table_store.close()
+            st.session_state.table_store = None
             st.session_state.tables = {}
             st.session_state.dataset_signature = None
             st.session_state.messages = []
-            st.session_state.direct_results = {}
+            st.session_state.query_results = {}
             st.error(f'File loading failed: {e}')
 else:
     if st.session_state.get('search_index'):
         st.session_state.search_index.close()
     st.session_state.search_index = None
+    if st.session_state.get('table_store'):
+        st.session_state.table_store.close()
+    st.session_state.table_store = None
     st.session_state.tables = {}
     st.session_state.dataset_signature = None
-    st.session_state.direct_results = {}
+    st.session_state.query_results = {}
 
 if st.session_state.tables:
+    with st.sidebar:
+        scope_options = [None] + list(st.session_state.tables)
+        dataset_scope = st.selectbox('Query dataset', scope_options,
+                                    format_func=lambda value: 'All uploaded datasets' if value is None else value,
+                                    help='Narrow the schema sent to the model when you have many tables or columns.')
     st.subheader('Loaded datasets')
     for name, df in st.session_state.tables.items():
         with st.expander(f'{name} — {len(df):,} rows × {len(df.columns)} columns'):
@@ -179,24 +193,22 @@ if question:
             started = time.monotonic()
             status = st.status(f'Analyzing — maximum {ANALYSIS_TIMEOUT} seconds', expanded=True)
             try:
-                st.session_state.direct_results = {}
+                st.session_state.query_results = {}
                 chat = bounded_chat(pending)
-                direct = answer_missing_aadhaar(question, st.session_state.tables)
-                if direct is not None:
-                    status.write('Checking missing Aadhaar values across every row on the server…')
-                    answer = direct.answer
-                    st.session_state.direct_results = direct.results
-                else:
-                    if not api_key:
-                        raise ValueError('Enter your API key in Settings.')
-                    if not model_name.strip():
-                        raise ValueError('Enter a model name in Settings.')
-                    model = build_model(provider, model_name.strip(), api_key)
-                    agent = create_data_agent(model, st.session_state.tables, input_budget,
-                                              st.session_state.get('search_index'))
-                    def progress(message):
-                        status.write(f'{time.monotonic() - started:.0f}s · {message}')
-                    answer = asyncio.run(analyze(agent, chat, progress))
+                if not api_key:
+                    raise ValueError('Enter your API key in Settings.')
+                if not model_name.strip():
+                    raise ValueError('Enter a model name in Settings.')
+                model = build_model(provider, model_name.strip(), api_key)
+                def progress(message):
+                    status.write(f'{time.monotonic() - started:.0f}s · {message}')
+                result = asyncio.run(run_query(model, st.session_state.tables, chat, progress,
+                                              input_budget=input_budget,
+                                              search_index=st.session_state.get('search_index'),
+                                              store=st.session_state.get('table_store'),
+                                              table_names=[dataset_scope] if dataset_scope is not None else None))
+                answer = result.answer
+                st.session_state.query_results = result.results
                 status.update(label=f'Completed in {time.monotonic() - started:.1f}s', state='complete', expanded=False)
                 st.markdown(answer)
                 st.session_state.messages = pending
@@ -206,11 +218,11 @@ if question:
                 st.error(friendly_error(exc))
                 st.caption('Your files are still loaded. You can submit the question again; failed turns are not added to model history.')
 
-for index, (source, result) in enumerate(st.session_state.get('direct_results', {}).items()):
-    st.caption(f'{source} — {len(result):,} matching records')
+for index, (source, result) in enumerate(st.session_state.get('query_results', {}).items()):
+    st.caption(f'{source} — {len(result):,} result rows')
     st.dataframe(sanitize_dataframe(result), **WIDE)
-    st.download_button('Download matching records (CSV)', result.to_csv(index=False),
-                       f'missing_aadhaar_{index + 1}.csv', mime='text/csv', key=f'direct_result_{index}')
+    st.download_button('Download query results (CSV)', result.to_csv(index=False),
+                       f'query_results_{index + 1}.csv', mime='text/csv', key=f'query_result_{index}')
 
 if st.session_state.messages:
     st.download_button('⬇️ Export conversation', json.dumps(st.session_state.messages, ensure_ascii=False, indent=2),

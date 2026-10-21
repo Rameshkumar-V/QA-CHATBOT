@@ -33,7 +33,7 @@ def create_data_agent(model, tables, input_budget=6000, search_index=None):
             'Call list_tables for exact names, then only relevant tools. Use aggregate for full-data '
             'calculations, never totals from previews. For documents query search_documents with a few '
             'keywords. For missing/blank/not-given fields use filter_rows with is_missing and return only '
-            'identifiers (e.g. student name and roll). matches is the exact full-data count; rows may be a subset. '
+            'requested output fields. matches is the exact full-data count; rows may be a subset. '
             'After this query answer directly; do not search documents or preview every row for blanks. '
             'Never read all rows or page through the entire document. Cite table, row, column '
             'and page from retrieved evidence. Search is lexical; no matches is not proof of absence. '

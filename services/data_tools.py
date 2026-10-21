@@ -238,7 +238,7 @@ def make_tools(tables: dict[str, pd.DataFrame], search_index=None):
     @tool
     def filter_rows(table: str, column: str, operator: str, value: str = '', limit: int = 15,
                     columns: list[str] | None = None) -> str:
-        """Query all rows: is_missing/is_not_missing (no value needed), ==, !=, >, >=, <, <=, contains. columns selects returned identifiers, e.g. student name/roll. Returns exact match count and up to 20 matching rows."""
+        """Query all rows: is_missing/is_not_missing (no value needed), ==, !=, >, >=, <, <=, contains. columns selects returned fields. Returns exact match count and up to 20 matching rows."""
         try:
             df = get_table(table)
             if column not in df:

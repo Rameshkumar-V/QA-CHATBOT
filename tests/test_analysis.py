@@ -172,7 +172,7 @@ class ErrorTests(unittest.TestCase):
         upload = io.BytesIO(b'text\ncancellation policy\n')
         upload.name, upload.size, upload.file_id = 'doc.csv', len(upload.getvalue()), 'test-file'
         with patch('streamlit.file_uploader', return_value=[upload]), \
-             patch('services.analysis.analyze', side_effect=TimeoutError()), \
+             patch('services.query_planner.run_query', side_effect=TimeoutError()), \
              patch('agent.factory.build_model', return_value=None), \
              patch('agent.factory.create_data_agent', return_value=None):
             app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / 'app.py')).run(timeout=30)

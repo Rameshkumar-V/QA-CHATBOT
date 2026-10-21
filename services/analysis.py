@@ -47,6 +47,8 @@ def friendly_error(exc):
     status = getattr(exc, 'status_code', None)
     # Inspect provider text only for classification; do not display it.
     detail = str(exc).lower()
+    if kind == 'QueryPlanError':
+        return 'The model could not produce a valid query plan after one correction. No result was produced. Try restating the question with the column names shown in the dataset preview.'
     if isinstance(exc, TimeoutError) or 'timeout' in kind.lower():
         return 'Analysis timed out. Ask one focused question or try again. No automatic retry was made.'
     if isinstance(exc, ContextBudgetError) or any(term in detail for term in
