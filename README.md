@@ -1,0 +1,77 @@
+# Personal AI Data Agent
+
+Local Streamlit UI + LangChain read-only data agent using user-provided Gemini, OpenAI, xAI (Grok) or GroqCloud API keys.
+
+## Deploy on Streamlit Community Cloud
+
+1. Push this folder to your GitHub repository. Do not commit `.venv`, API keys, or uploaded datasets.
+2. At https://share.streamlit.io choose **Create app**, select your repository and branch `main`, and set the main file to **app.py**.
+3. In **Advanced settings**, choose **Python 3.12**. Dependencies install from `requirements.txt`; no Windows packages are needed.
+4. Optionally add provider keys in the Cloud **Secrets** settings using `.streamlit/secrets.toml.example`. These keys are shared with all app visitors and consume the owner's quota. Otherwise each visitor enters a key in the sidebar.
+5. Deploy. Choose a provider and a model that supports tool calling, upload an Excel workbook, and ask a question.
+
+Deployment reference: https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/deploy
+
+## Large Excel files and small models
+
+10,000 rows are processed by pandas on the app server. The model receives table metadata, bounded samples, and calculated results; the whole workbook is never inserted into a prompt. Totals, counts, filters, and grouped calculations scan the full table. Preview rows are only for inspection. Grouped results return the top 20 groups with the total group count, so a partial listing is explicit.
+
+Each tool response is limited to 6,000 characters of valid JSON. Oversized results are marked as truncated; long cell text is marked when shortened. Schema inspection supports 12-column pages or a single requested column. Recent conversation context is limited to 6,000 characters plus the current question (maximum 4,000 characters). These are character budgets, not tokenizer guarantees: a model still needs enough context for tool definitions and multiple tool calls, plus reliable tool-calling support. Arbitrarily tiny models and complex joins are not guaranteed.
+
+Limits: 20 MB per file, 60 MB combined uploads, 200,000 rows per table, 30 sheets per workbook, and 200 MB estimated DataFrame memory per session. Cloud resources are shared across users; large compressed workbooks can use substantial memory during parsing before the memory check. Uploaded tables, settings and entered keys are held per session. Refreshing or reconnecting may reset them. Analysis occurs on the Cloud server when deployed, and bounded tool results are sent to the selected provider.
+
+Run the regression checks with `python -m unittest discover -s tests -v`. They generate a 10,000-row workbook in memory and verify full-data totals, grouping, filtering, output limits and session isolation without API calls.
+
+## Run locally (Windows)
+
+1. Install Python 3.11 or 3.12.
+2. Open a terminal in this folder.
+3. `py -m venv .venv`
+4. `.venv\Scripts\activate`
+5. `pip install -r requirements.txt`
+6. `run_windows.bat` (or `streamlit run app.py`)
+7. In sidebar settings choose provider, model name and API key. Upload files and ask questions.
+
+Current starter model IDs are only examples; replace them with an enabled model from your provider account if an API reports unavailable model.
+
+## Make Windows EXE
+
+On Windows, run `build_windows.bat` from this folder. The resulting executable is at `dist\PersonalDataAgent\PersonalDataAgent.exe`. Keep the whole `PersonalDataAgent` folder together, including its `_internal` contents. Double-clicking the EXE starts Streamlit locally and opens a browser tab. It is **not** a native desktop window. Windows EXEs must be built on Windows.
+
+PyInstaller + Streamlit bundling can need adjustments for specific versions/environment; treat build.bat as a starting point, not a guaranteed one-click build on all systems. A simple reliable alternative is shipping a .bat that runs `run_windows.bat` (or `streamlit run app.py`) on machines with Python installed.
+
+## Functionality and limits
+
+- CSV, XLSX, XLS, JSON, TXT, MD and text-based PDF (not scanned/OCR).
+- Excel workbook sheets are loaded as separate named datasets.
+- Agent tools: list tables, inspect columns and stats, preview rows, value counts, aggregate metrics, filter rows.
+- Uploads are read locally into pandas, and relevant tool outputs are sent to the selected cloud LLM. No arbitrary Python execution and no modification of source files.
+- Max 20 MB/file; 200,000 rows/table; up to 30 Excel sheets; PDF text max 100 pages or 60,000 characters. Avoid opening files that contain highly sensitive information unless your chosen AI provider's data policy is acceptable.
+- API keys and provider/model settings stay in the browser session by default. For a trusted local desktop only, install `requirements-desktop.txt` and set `ENABLE_OS_KEYRING=1` to enable optional OS credential storage. Keep this option disabled on shared servers.
+- Agent tools return bounded data samples; for complex joins, plotting, pivots and larger-scale analysis, add explicit constrained tools.
+- Works online only: API calls to Gemini, xAI, GroqCloud or OpenAI require internet access, API key, and available quota/billing. Provider model IDs can be changed in Settings.
+
+## Actual folder structure
+
+```text
+Personal_AI_Data_Agent_Windows/
+├── app.py                    # Streamlit UI and settings
+├── requirements.txt
+├── run_windows.bat           # Run from source
+├── build_windows.bat         # Windows 10/11 EXE packaging
+├── README.md
+├── agent/
+│   ├── __init__.py
+│   └── factory.py            # Gemini / OpenAI / Grok / GroqCloud and LangChain agent
+├── services/
+│   ├── __init__.py
+│   └── data_tools.py         # CSV / Excel / JSON / PDF tools
+└── desktop/
+    └── launcher.py           # Streamlit EXE launcher
+```
+
+Build from Windows 10 x64 using Python 3.11 to target Windows 10 and Windows 11 x64. Python is bundled in the distribution, but keep the entire `dist/PersonalDataAgent` directory. This is not a tested/prebuilt exe; build and smoke-test on both OS versions. The UI runs in your default web browser on localhost.
+
+## GroqCloud vs xAI Grok
+
+GroqCloud and xAI Grok are separate services with incompatible API keys. Select **GroqCloud** for keys from https://console.groq.com/keys (endpoint `https://api.groq.com/openai/v1`); select **Grok (xAI)** for keys from https://console.x.ai (endpoint `https://api.x.ai/v1`). Set the model to one supported by your provider. GroqCloud starter example: `llama-3.3-70b-versatile`.
