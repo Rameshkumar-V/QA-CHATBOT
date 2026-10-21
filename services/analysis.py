@@ -64,6 +64,6 @@ def friendly_error(exc):
         return 'The analysis step limit was reached before a final answer was produced. Your files are still loaded; retry the question or clear the conversation.'
     if status == 400 or 'tool' in detail and any(word in detail for word in ('failed', 'invalid', 'support')):
         return 'The model could not complete a valid request or tool call. Try a simpler question or another model that supports tool calling.'
-    if isinstance(exc, ValueError) and str(exc).startswith(('Please shorten', 'The model')):
+    if isinstance(exc, ValueError) and str(exc).startswith(('Please shorten', 'The model', 'Enter your API key', 'Enter a model name')):
         return str(exc)
     return 'Analysis failed unexpectedly. Try a simpler question, check the provider settings, and retry.'

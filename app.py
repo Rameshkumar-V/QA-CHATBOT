@@ -13,6 +13,7 @@ from agent.factory import create_data_agent, build_model
 from services.context import bounded_chat
 from services.analysis import analyze, friendly_error, ANALYSIS_TIMEOUT
 from services.search import DocumentSearch
+from services.direct_queries import answer_missing_aadhaar
 
 def _width_kwarg(stretch: bool = True) -> dict:
     if 'width' in inspect.signature(st.button).parameters:
@@ -110,8 +111,10 @@ with st.sidebar:
     st.caption('Full datasets are analyzed on the app server. Only bounded tool results are sent to your AI provider. Settings and entered keys stay in this browser session.')
     st.caption('10,000+ rows work with small models that support tool calling. Calculations use every row, not just the preview.')
     st.caption('Documents use indexed keyword queries with source excerpts. Analysis stops after 60 seconds or 5 model calls.')
+    st.caption('Missing Aadhaar queries run directly on the server without model calls, including Adaar/Adhaar spellings.')
     if st.button('Clear conversation', **WIDE):
         st.session_state.messages = []
+        st.session_state.direct_results = {}
         st.rerun()
 
 if uploads:
@@ -134,6 +137,7 @@ if uploads:
             st.session_state.search_index = DocumentSearch(all_tables)
             st.session_state.dataset_signature = sig
             st.session_state.messages = []
+            st.session_state.direct_results = {}
         except Exception as e:
             if st.session_state.get('search_index'):
                 st.session_state.search_index.close()
@@ -141,6 +145,7 @@ if uploads:
             st.session_state.tables = {}
             st.session_state.dataset_signature = None
             st.session_state.messages = []
+            st.session_state.direct_results = {}
             st.error(f'File loading failed: {e}')
 else:
     if st.session_state.get('search_index'):
@@ -148,6 +153,7 @@ else:
     st.session_state.search_index = None
     st.session_state.tables = {}
     st.session_state.dataset_signature = None
+    st.session_state.direct_results = {}
 
 if st.session_state.tables:
     st.subheader('Loaded datasets')
@@ -165,10 +171,6 @@ question = st.chat_input('Example: Which product has the highest total sales?')
 if question:
     if not st.session_state.tables:
         st.warning('Please upload at least one file first.')
-    elif not api_key:
-        st.warning('Enter your API key in Settings.')
-    elif not model_name.strip():
-        st.warning('Enter a model name in Settings.')
     else:
         pending = st.session_state.messages + [{'role': 'user', 'content': question}]
         with st.chat_message('user'):
@@ -177,13 +179,24 @@ if question:
             started = time.monotonic()
             status = st.status(f'Analyzing — maximum {ANALYSIS_TIMEOUT} seconds', expanded=True)
             try:
+                st.session_state.direct_results = {}
                 chat = bounded_chat(pending)
-                model = build_model(provider, model_name.strip(), api_key)
-                agent = create_data_agent(model, st.session_state.tables, input_budget,
-                                          st.session_state.get('search_index'))
-                def progress(message):
-                    status.write(f'{time.monotonic() - started:.0f}s · {message}')
-                answer = asyncio.run(analyze(agent, chat, progress))
+                direct = answer_missing_aadhaar(question, st.session_state.tables)
+                if direct is not None:
+                    status.write('Checking missing Aadhaar values across every row on the server…')
+                    answer = direct.answer
+                    st.session_state.direct_results = direct.results
+                else:
+                    if not api_key:
+                        raise ValueError('Enter your API key in Settings.')
+                    if not model_name.strip():
+                        raise ValueError('Enter a model name in Settings.')
+                    model = build_model(provider, model_name.strip(), api_key)
+                    agent = create_data_agent(model, st.session_state.tables, input_budget,
+                                              st.session_state.get('search_index'))
+                    def progress(message):
+                        status.write(f'{time.monotonic() - started:.0f}s · {message}')
+                    answer = asyncio.run(analyze(agent, chat, progress))
                 status.update(label=f'Completed in {time.monotonic() - started:.1f}s', state='complete', expanded=False)
                 st.markdown(answer)
                 st.session_state.messages = pending
@@ -192,6 +205,12 @@ if question:
                 status.update(label='Analysis stopped', state='error', expanded=False)
                 st.error(friendly_error(exc))
                 st.caption('Your files are still loaded. You can submit the question again; failed turns are not added to model history.')
+
+for index, (source, result) in enumerate(st.session_state.get('direct_results', {}).items()):
+    st.caption(f'{source} — {len(result):,} matching records')
+    st.dataframe(sanitize_dataframe(result), **WIDE)
+    st.download_button('Download matching records (CSV)', result.to_csv(index=False),
+                       f'missing_aadhaar_{index + 1}.csv', mime='text/csv', key=f'direct_result_{index}')
 
 if st.session_state.messages:
     st.download_button('⬇️ Export conversation', json.dumps(st.session_state.messages, ensure_ascii=False, indent=2),
